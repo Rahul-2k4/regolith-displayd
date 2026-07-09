@@ -81,3 +81,22 @@ impl Modes {
         self.properties.current == Some(true)
     }
 }
+
+#[cfg(test)]
+impl Modes {
+    pub(crate) fn test_new(id: &str) -> Modes {
+        Modes {
+            id: id.to_string(),
+            width: 1024,
+            height: 768,
+            refresh_rate: 60.0,
+            preferred_scale: 1.0,
+            supported_scales: vec![1.0],
+            properties: ModeProperties {
+                current: Some(true),
+                preferred: Some(false),
+                interlaced: Some(false),
+            },
+        }
+    }
+}

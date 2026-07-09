@@ -77,6 +77,11 @@ pub struct MonitorApply {
     pub monitors: Vec<(String, String, MonitorProperties)>,
 }
 
+pub(crate) trait KanshiProfileEntry {
+    fn find_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor>;
+    fn write_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) -> bool;
+}
+
 impl Monitor {
     pub fn new(output: &Output) -> Monitor {
         let output_modes = output.modes.iter().map(|m| Modes::new(output, m)).collect();
@@ -106,6 +111,35 @@ impl Monitor {
         match self.modes.iter().find(|&mode| mode.current()) {
             Some(m) => m.get_modestr(),
             None => "Unknown",
+        }
+    }
+}
+
+#[cfg(test)]
+impl Monitor {
+    pub(crate) fn test_new(
+        name: &str,
+        make: &str,
+        model: &str,
+        serial: &str,
+        modes: Vec<Modes>,
+    ) -> Monitor {
+        Monitor {
+            description: (
+                name.to_string(),
+                make.to_string(),
+                model.to_string(),
+                serial.to_string(),
+            ),
+            modes,
+            properties: MonitorProperties {
+                width: None,
+                height: None,
+                underscanning: None,
+                builtin: Some(false),
+                max_size: None,
+                name: Some(format!("{make} {model} {serial}")),
+            },
         }
     }
 }
@@ -236,6 +270,70 @@ impl LogicalMonitor {
     }
 }
 
+#[cfg(test)]
+impl LogicalMonitor {
+    pub(crate) fn test_new(
+        name: &str,
+        mode_id: &str,
+        x_pos: i32,
+        y_pos: i32,
+        scale: f64,
+        transform: u32,
+        primary: bool,
+    ) -> LogicalMonitor {
+        LogicalMonitor {
+            x_pos,
+            y_pos,
+            scale,
+            transform,
+            primary,
+            monitors: vec![(
+                name.to_string(),
+                mode_id.to_string(),
+                String::new(),
+                String::new(),
+            )],
+            properties: LogicalMonitorProperties {
+                dummy: None,
+                dummy2: None,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl MonitorApply {
+    pub(crate) fn test_new(
+        name: &str,
+        mode_id: &str,
+        x_pos: i32,
+        y_pos: i32,
+        scale: f64,
+        transform: u32,
+        primary: bool,
+    ) -> MonitorApply {
+        MonitorApply {
+            x_pos,
+            y_pos,
+            scale,
+            transform,
+            primary,
+            monitors: vec![(
+                name.to_string(),
+                mode_id.to_string(),
+                MonitorProperties {
+                    width: None,
+                    height: None,
+                    underscanning: None,
+                    builtin: Some(false),
+                    max_size: None,
+                    name: Some(String::new()),
+                },
+            )],
+        }
+    }
+}
+
 impl MonitorApply {
     fn get_modestr(&self, monitor: &Monitor) -> Option<String> {
         let modestr = &self.monitors[0].1;
@@ -245,7 +343,7 @@ impl MonitorApply {
         }
     }
 
-    pub fn search_monitor<'a>(&self, monitors: &'a Vec<Monitor>) -> Option<&'a Monitor> {
+    pub fn search_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
         monitors
             .iter()
             .find(|mon| mon.description.0 == self.monitors[0].0)
@@ -253,7 +351,7 @@ impl MonitorApply {
 
     pub fn search_logical_monitor<'a>(
         &self,
-        logical_monitors: &'a Vec<LogicalMonitor>,
+        logical_monitors: &'a [LogicalMonitor],
     ) -> Option<&'a LogicalMonitor> {
         logical_monitors
             .iter()
@@ -261,29 +359,13 @@ impl MonitorApply {
     }
 
     pub fn save_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) {
-        let dpy_name = monitor.get_dpy_name();
-        let mode = match self.get_modestr(&monitor) {
-            Some(x) => x,
-            _ => return,
-        };
-        let transform =
-            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
-        let config = format!(
-            "output \"{}\" mode {} position {},{} transform {} scale {} enable",
-            dpy_name,
-            mode,
-            self.x_pos,
-            self.y_pos,
-            transform.to_sway(),
-            self.scale
-        );
-        writeln!(kanshi_file, "\t{config}").unwrap();
+        let _ = <Self as KanshiProfileEntry>::write_kanshi(self, kanshi_file, monitor);
     }
 
     pub fn verify(
         &self,
         _sway_connect: &Arc<Mutex<Connection>>,
-        monitors: &Vec<Monitor>,
+        monitors: &[Monitor],
     ) -> zbus::fdo::Result<()> {
         let monitor = self
             .search_monitor(monitors)
@@ -309,5 +391,62 @@ impl MonitorApply {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
         }
         Ok(())
+    }
+}
+
+impl KanshiProfileEntry for MonitorApply {
+    fn find_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
+        self.search_monitor(monitors)
+    }
+
+    fn write_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) -> bool {
+        let dpy_name = monitor.get_dpy_name();
+        let mode = match self.get_modestr(monitor) {
+            Some(x) => x,
+            _ => return false,
+        };
+        let transform =
+            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
+        let config = format!(
+            "output \"{}\" mode {} position {},{} transform {} scale {} enable",
+            dpy_name,
+            mode,
+            self.x_pos,
+            self.y_pos,
+            transform.to_sway(),
+            self.scale
+        );
+        writeln!(kanshi_file, "\t{config}").unwrap();
+        true
+    }
+}
+
+impl KanshiProfileEntry for LogicalMonitor {
+    fn find_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
+        let monitor_name = &self.monitors[0].0;
+        monitors
+            .iter()
+            .find(|mon| mon.description.0 == *monitor_name)
+    }
+
+    fn write_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) -> bool {
+        let dpy_name = monitor.get_dpy_name();
+        let mode = monitor.get_current_mode();
+        if mode == "Unknown" {
+            return false;
+        }
+        let transform =
+            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
+        let config = format!(
+            "output \"{}\" mode {} position {},{} transform {} scale {} enable",
+            dpy_name,
+            mode,
+            self.x_pos,
+            self.y_pos,
+            transform.to_sway(),
+            self.scale
+        );
+        writeln!(kanshi_file, "\t{config}").unwrap();
+        true
     }
 }

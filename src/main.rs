@@ -30,4 +30,3 @@ async fn main() -> Result<(), Box<dyn Error>> {
     pending::<()>().await;
     Ok(())
 }
-

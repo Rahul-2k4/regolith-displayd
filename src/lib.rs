@@ -4,19 +4,12 @@ pub mod monitor;
 use core::fmt;
 use lazy_static::lazy_static;
 use log::{debug, error, info, warn};
-use monitor::{LogicalMonitor, Monitor, MonitorApply};
+use monitor::{KanshiProfileEntry, LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::Command;
-use std::{
-    error::Error,
-    fs::{self, File},
-    path::PathBuf,
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{error::Error, fs, path::PathBuf, sync::Arc, thread, time::Duration};
 use swayipc_async::Connection;
 use tokio::sync::Mutex;
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
@@ -87,38 +80,7 @@ impl DisplayServer {
             error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
             return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
         }
-        let get_dpy_name = |mon: &MonitorApply| {
-            let monitor = mon.search_monitor(&manager_obj.monitors).unwrap();
-            monitor.get_dpy_name().replace(" ", "_")
-        };
 
-        let mut monitors_sorted = manager_obj.monitors.clone();
-
-        monitors_sorted.sort_by_key(|monitor| monitor.get_dpy_name());
-
-        let profile_name = monitors_sorted
-            .iter()
-            .map(|mon| mon.get_dpy_name().replace(" ", "_"))
-            .collect::<Vec<String>>()
-            .join("__");
-        info!("Profile FileName: {profile_name}");
-
-        let kanshi_paths = get_kanshi_paths().await?;
-
-        fs::create_dir_all(&kanshi_paths.profiles).unwrap();
-        let mut profile_file = File::options()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(kanshi_paths.profiles.join(&profile_name))
-            .expect("Error while opening profile file for writing");
-
-        // Profile Write buffer (Only written if no errors occur)
-        let mut profile_buf = Vec::new();
-
-        let mut active_physical_monitors = Vec::new();
-
-        writeln!(&mut profile_buf, "profile {{").unwrap();
         for mutter_logical_mointor in &mutter_logical_monitors {
             // If apply_monitors_config called with method == 0 (Verify configuration)
             if method == 0 {
@@ -131,36 +93,30 @@ impl DisplayServer {
                     }
                 }
             }
-            let Some(sway_physical_monitor) = mutter_logical_mointor.search_monitor(&manager_obj.monitors) else {
-                continue;
-            };
-
-            active_physical_monitors.push(sway_physical_monitor.clone());
-            mutter_logical_mointor.save_kanshi(&mut profile_buf, &sway_physical_monitor);
         }
         if method == 0 {
             return Ok(());
         }
 
-        for disabled_mon in manager_obj.get_disabled_monitors(&active_physical_monitors) {
-            writeln!(
-                &mut profile_buf,
-                "\toutput \"{}\" disable",
-                disabled_mon.get_dpy_name()
-            )
-            .expect("Failed to write to file");
-        }
-        writeln!(&mut profile_buf, "}}").unwrap();
         manager_obj.properties = properties;
 
-        if let Err(e) = profile_file.write(&profile_buf) {
-            error!("Error writing data to kanshi config file: {e}");
-            return Err(zbus::fdo::Error::IOError(e.to_string()));
-        }
+        let profile_name = profile_name_for_monitors(&manager_obj.monitors);
+        let profile_text = kanshi_profile_text(&manager_obj.monitors, &mutter_logical_monitors);
+        info!("Profile FileName: {profile_name}");
 
-        // reload kanshi config
-        if let Err(e) = reload_kanshi().await {
-            error!("Error reloading kanshi configuration: {e}");
+        let profile_changed =
+            match write_kanshi_profile_if_changed(&profile_name, &profile_text).await {
+                Ok(changed) => changed,
+                Err(e) => {
+                    error!("Error writing data to kanshi config file: {e}");
+                    return Err(zbus::fdo::Error::IOError(e.to_string()));
+                }
+            };
+
+        if profile_changed {
+            if let Err(e) = reload_kanshi().await {
+                error!("Error reloading kanshi configuration: {e}");
+            }
         }
         if let Err(e) = manager_obj.get_monitor_info(&self.sway_connection).await {
             error!("Error getting output information from sway: {e}");
@@ -222,48 +178,55 @@ impl DisplayManager {
         manager_obj: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut prev_monitor_set = HashSet::new();
-        let mut prev_logical_monitor_set = HashSet::new();
+        let display_info = {
+            let mut manager_obj_lock = manager_obj.lock().await;
+            manager_obj_lock.get_monitor_info(&sway_connection).await?
+        };
+        let mut prev_monitor_set: HashSet<Monitor> = display_info.0.iter().cloned().collect();
+        let mut prev_logical_monitor_set: HashSet<LogicalMonitor> =
+            display_info.1.iter().cloned().collect();
+        {
+            let mut manager_obj_lock = manager_obj.lock().await;
+            manager_obj_lock.monitors = display_info.0;
+            manager_obj_lock.logical_monitors = display_info.1;
+        }
         loop {
             thread::sleep(Duration::from_millis(700));
-            let mut manager_obj_lock = manager_obj.lock().await;
-            let display_info = manager_obj_lock
-                .get_monitor_info(&sway_connection)
-                .await
-                .unwrap();
+            let display_info = {
+                let mut manager_obj_lock = manager_obj.lock().await;
+                manager_obj_lock.get_monitor_info(&sway_connection).await?
+            };
             let mut monitor_set = HashSet::new();
             let mut logical_monitor_set = HashSet::new();
-            let mut monitors_changed = false;
             for monitor in &display_info.0 {
-                if !prev_monitor_set.contains(monitor) {
-                    monitors_changed = true;
-                }
                 monitor_set.insert(monitor.clone());
             }
             for logical_monitor in &display_info.1 {
-                if !prev_logical_monitor_set.contains(logical_monitor) {
-                    monitors_changed = true;
-                }
                 logical_monitor_set.insert(logical_monitor.clone());
             }
-            if monitors_changed {
+            if display_state_changed(
+                &prev_monitor_set,
+                &prev_logical_monitor_set,
+                &monitor_set,
+                &logical_monitor_set,
+            ) {
+                let profile_name = profile_name_for_monitors(&display_info.0);
+                let profile_text = kanshi_profile_text(&display_info.0, &display_info.1);
+                {
+                    let mut manager_obj_lock = manager_obj.lock().await;
+                    manager_obj_lock.monitors = display_info.0;
+                    manager_obj_lock.logical_monitors = display_info.1;
+                    debug!("monitors info: {:#?}", manager_obj_lock.monitors);
+                    debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
+                }
                 prev_monitor_set = monitor_set;
                 prev_logical_monitor_set = logical_monitor_set;
-                manager_obj_lock.monitors = display_info.0.clone();
-                manager_obj_lock.logical_monitors = display_info.1.clone();
-                debug!("monitors info: {:#?}", manager_obj_lock.monitors);
-                debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
+                if write_kanshi_profile_if_changed(&profile_name, &profile_text).await? {
+                    reload_kanshi().await?;
+                }
                 Self::emit_monitors_changed().await?;
             }
         }
-    }
-
-    /// Get list of all the monitors that are not active
-    fn get_disabled_monitors(&self, active_physical_monitors: &[Monitor]) -> Vec<&Monitor> {
-        self.monitors
-            .iter()
-            .filter(|mon| !active_physical_monitors.contains(mon))
-            .collect()
     }
 
     pub async fn emit_monitors_changed() -> zbus::Result<()> {
@@ -361,4 +324,265 @@ pub async fn reload_kanshi() -> zbus::Result<()> {
     Command::new("killall").arg("kanshi").spawn()?;
     Command::new("kanshi").arg("-c").arg(&config_path).spawn()?;
     Ok(())
+}
+
+fn profile_name_for_monitors(monitors: &[Monitor]) -> String {
+    let mut display_names = monitors
+        .iter()
+        .map(|monitor| monitor.get_dpy_name())
+        .collect::<Vec<String>>();
+    display_names.sort();
+    display_names
+        .into_iter()
+        .map(|display_name| display_name.replace(" ", "_"))
+        .collect::<Vec<String>>()
+        .join("__")
+}
+
+fn kanshi_profile_text<T: KanshiProfileEntry>(
+    monitors: &[Monitor],
+    logical_monitors: &[T],
+) -> String {
+    let mut profile_buf = Vec::new();
+    write_kanshi_profile(&mut profile_buf, monitors, logical_monitors);
+    String::from_utf8(profile_buf).expect("Generated kanshi profile should be valid UTF-8")
+}
+
+fn write_kanshi_profile<T: KanshiProfileEntry>(
+    profile_buf: &mut Vec<u8>,
+    monitors: &[Monitor],
+    logical_monitors: &[T],
+) {
+    let mut active_physical_monitors = Vec::new();
+
+    writeln!(profile_buf, "profile {{").unwrap();
+    for logical_monitor in logical_monitors {
+        let Some(sway_physical_monitor) = logical_monitor.find_monitor(monitors) else {
+            continue;
+        };
+
+        if logical_monitor.write_kanshi(profile_buf, sway_physical_monitor) {
+            active_physical_monitors.push(sway_physical_monitor.clone());
+        }
+    }
+
+    for disabled_mon in get_disabled_monitors(monitors, &active_physical_monitors) {
+        writeln!(
+            profile_buf,
+            "\toutput \"{}\" disable",
+            disabled_mon.get_dpy_name()
+        )
+        .expect("Failed to write to file");
+    }
+    writeln!(profile_buf, "}}").unwrap();
+}
+
+fn get_disabled_monitors<'a>(
+    monitors: &'a [Monitor],
+    active_physical_monitors: &[Monitor],
+) -> Vec<&'a Monitor> {
+    monitors
+        .iter()
+        .filter(|mon| !active_physical_monitors.contains(mon))
+        .collect()
+}
+
+fn display_state_changed(
+    prev_monitors: &HashSet<Monitor>,
+    prev_logical_monitors: &HashSet<LogicalMonitor>,
+    current_monitors: &HashSet<Monitor>,
+    current_logical_monitors: &HashSet<LogicalMonitor>,
+) -> bool {
+    prev_monitors != current_monitors || prev_logical_monitors != current_logical_monitors
+}
+
+async fn write_kanshi_profile_if_changed(
+    profile_name: &str,
+    profile_text: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let kanshi_paths = get_kanshi_paths().await?;
+    fs::create_dir_all(&kanshi_paths.profiles)?;
+    let profile_path = kanshi_paths.profiles.join(profile_name);
+
+    if let Ok(existing_profile) = fs::read_to_string(&profile_path) {
+        if existing_profile == profile_text {
+            debug!("Kanshi profile unchanged; skipping write");
+            return Ok(false);
+        }
+    }
+
+    fs::write(&profile_path, profile_text)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modes::Modes;
+    use crate::monitor::{LogicalMonitor, Monitor, MonitorApply};
+
+    fn build_manager(
+        monitors: Vec<Monitor>,
+        logical_monitors: Vec<LogicalMonitor>,
+    ) -> DisplayManager {
+        DisplayManager {
+            serial: 1,
+            monitors,
+            logical_monitors,
+            properties: DisplayManagerProperties::new(),
+        }
+    }
+
+    #[test]
+    fn renders_active_and_disabled_outputs() {
+        let active_mode = Modes::test_new("1024x768@60Hz");
+        let disabled_mode = Modes::test_new("1920x1080@60Hz");
+        let active_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![active_mode.clone()],
+        );
+        let disabled_monitor =
+            Monitor::test_new("HDMI-A-1", "Projector", "Room", "B2", vec![disabled_mode]);
+        let logical_monitors = vec![LogicalMonitor::test_new(
+            "eDP-1",
+            "1024x768@60Hz",
+            10,
+            20,
+            1.0,
+            0,
+            true,
+        )];
+        let manager = build_manager(vec![active_monitor, disabled_monitor], logical_monitors);
+
+        let profile = kanshi_profile_text(&manager.monitors, &manager.logical_monitors);
+
+        assert_eq!(
+            profile,
+            "profile {\n\
+\toutput \"Regolith Panel A1\" mode 1024x768@60Hz position 10,20 transform normal scale 1 enable\n\
+\toutput \"Projector Room B2\" disable\n\
+}\n"
+        );
+    }
+
+    #[test]
+    fn renders_all_monitors_disabled_without_logical_state() {
+        let monitor_a = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let monitor_b = Monitor::test_new(
+            "HDMI-A-1",
+            "Projector",
+            "Room",
+            "B2",
+            vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let manager = build_manager(vec![monitor_a, monitor_b], Vec::new());
+
+        let profile = kanshi_profile_text(&manager.monitors, &manager.logical_monitors);
+
+        assert_eq!(
+            profile,
+            "profile {\n\
+\toutput \"Regolith Panel A1\" disable\n\
+\toutput \"Projector Room B2\" disable\n\
+}\n"
+        );
+    }
+
+    #[test]
+    fn renders_apply_and_observed_state_with_one_helper() {
+        let active_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let disabled_monitor = Monitor::test_new(
+            "HDMI-A-1",
+            "Projector",
+            "Room",
+            "B2",
+            vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let manager = build_manager(
+            vec![active_monitor, disabled_monitor],
+            vec![LogicalMonitor::test_new(
+                "eDP-1", "ignored", 10, 20, 1.0, 0, true,
+            )],
+        );
+        let apply = MonitorApply::test_new("eDP-1", "1024x768@60Hz", 10, 20, 1.0, 0, true);
+
+        let observed_profile = kanshi_profile_text(&manager.monitors, &manager.logical_monitors);
+        let apply_profile = kanshi_profile_text(&manager.monitors, &[apply]);
+
+        assert_eq!(apply_profile, observed_profile);
+        assert_eq!(
+            apply_profile,
+            "profile {\n\
+\toutput \"Regolith Panel A1\" mode 1024x768@60Hz position 10,20 transform normal scale 1 enable\n\
+\toutput \"Projector Room B2\" disable\n\
+}\n"
+        );
+    }
+
+    #[test]
+    fn detects_monitor_removal_as_change() {
+        let prev_monitors = HashSet::from([
+            Monitor::test_new(
+                "eDP-1",
+                "Regolith",
+                "Panel",
+                "A1",
+                vec![Modes::test_new("1024x768@60Hz")],
+            ),
+            Monitor::test_new(
+                "HDMI-A-1",
+                "Projector",
+                "Room",
+                "B2",
+                vec![Modes::test_new("1920x1080@60Hz")],
+            ),
+        ]);
+        let prev_logical_monitors = HashSet::from([LogicalMonitor::test_new(
+            "eDP-1",
+            "1024x768@60Hz",
+            10,
+            20,
+            1.0,
+            0,
+            true,
+        )]);
+        let current_monitors = HashSet::from([Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        )]);
+        let current_logical_monitors = HashSet::from([LogicalMonitor::test_new(
+            "eDP-1",
+            "1024x768@60Hz",
+            10,
+            20,
+            1.0,
+            0,
+            true,
+        )]);
+
+        assert!(display_state_changed(
+            &prev_monitors,
+            &prev_logical_monitors,
+            &current_monitors,
+            &current_logical_monitors,
+        ));
+    }
 }
