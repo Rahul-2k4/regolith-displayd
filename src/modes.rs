@@ -99,4 +99,10 @@ impl Modes {
             },
         }
     }
+
+    pub(crate) fn test_new_without_current(id: &str) -> Modes {
+        let mut mode = Self::test_new(id);
+        mode.properties.current = Some(false);
+        mode
+    }
 }

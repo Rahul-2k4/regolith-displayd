@@ -147,6 +147,7 @@ impl Monitor {
 impl PartialEq for Monitor {
     fn eq(&self, other: &Self) -> bool {
         self.description == other.description
+            && self.get_current_mode() == other.get_current_mode()
     }
 }
 
@@ -432,20 +433,19 @@ impl KanshiProfileEntry for LogicalMonitor {
     fn write_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) -> bool {
         let dpy_name = monitor.get_dpy_name();
         let mode = monitor.get_current_mode();
-        if mode == "Unknown" {
-            return false;
-        }
         let transform =
             MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
-        let config = format!(
-            "output \"{}\" mode {} position {},{} transform {} scale {} enable",
-            dpy_name,
-            mode,
-            self.x_pos,
-            self.y_pos,
-            transform.to_sway(),
-            self.scale
-        );
+        let config = if mode == "Unknown" {
+            format!(
+                "output \"{}\" position {},{} transform {} scale {} enable",
+                dpy_name, self.x_pos, self.y_pos, transform.to_sway(), self.scale
+            )
+        } else {
+            format!(
+                "output \"{}\" mode {} position {},{} transform {} scale {} enable",
+                dpy_name, mode, self.x_pos, self.y_pos, transform.to_sway(), self.scale
+            )
+        };
         writeln!(kanshi_file, "\t{config}").unwrap();
         true
     }

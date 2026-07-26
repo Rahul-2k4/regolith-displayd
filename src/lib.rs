@@ -585,4 +585,59 @@ mod tests {
             &current_logical_monitors,
         ));
     }
+
+    #[test]
+    fn detects_current_mode_change_for_same_output_identity() {
+        let previous = Monitor::test_new(
+            "eDP-1", "Regolith", "Panel", "A1", vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let current = Monitor::test_new(
+            "eDP-1", "Regolith", "Panel", "A1", vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let empty = HashSet::new();
+
+        assert!(display_state_changed(
+            &HashSet::from([previous]),
+            &empty,
+            &HashSet::from([current]),
+            &empty,
+        ));
+    }
+
+    #[test]
+    fn equal_monitors_have_equal_hashes() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let left = Monitor::test_new(
+            "eDP-1", "Regolith", "Panel", "A1", vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let right = left.clone();
+        let mut left_hash = DefaultHasher::new();
+        let mut right_hash = DefaultHasher::new();
+        left.hash(&mut left_hash);
+        right.hash(&mut right_hash);
+
+        assert_eq!(left, right);
+        assert_eq!(left_hash.finish(), right_hash.finish());
+    }
+
+    #[test]
+    fn active_output_with_unknown_mode_is_enabled_not_disabled() {
+        let monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new_without_current("1024x768@60Hz")],
+        );
+        let logical = LogicalMonitor::test_new("eDP-1", "ignored", 10, 20, 1.0, 0, true);
+
+        let profile = kanshi_profile_text(&[monitor], &[logical]);
+
+        assert!(profile.contains(
+            "output \"Regolith Panel A1\" position 10,20 transform normal scale 1 enable"
+        ));
+        assert!(!profile.contains("output \"Regolith Panel A1\" disable"));
+    }
 }
