@@ -150,13 +150,16 @@ impl PartialEq for Monitor {
     }
 }
 
+// Sway reports one physical monitor per logical monitor here, and profile
+// generation resolves that ordered vector through its first element. Keep the
+// watcher identity on the same first-element boundary.
 impl PartialEq for LogicalMonitor {
     fn eq(&self, other: &Self) -> bool {
         self.x_pos == other.x_pos
             && self.y_pos == other.y_pos
-            && self.scale == other.scale
+            && self.scale.to_bits() == other.scale.to_bits()
             && self.transform == other.transform
-            && self.monitors == other.monitors
+            && self.monitors.first() == other.monitors.first()
     }
 }
 
@@ -176,9 +179,8 @@ impl Hash for LogicalMonitor {
         self.y_pos.hash(state);
         self.x_pos.hash(state);
         self.transform.hash(state);
-        let scale_int = (self.scale * 1000f64) as u32;
-        scale_int.hash(state);
-        self.monitors.hash(state);
+        self.scale.to_bits().hash(state);
+        self.monitors.first().hash(state);
     }
 }
 

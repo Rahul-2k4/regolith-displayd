@@ -210,8 +210,7 @@ impl DisplayManager {
                 &monitor_set,
                 &logical_monitor_set,
             ) {
-                let profile_name = profile_name_for_monitors(&display_info.0);
-                let profile_text = kanshi_profile_text(&display_info.0, &display_info.1);
+                let profile = observed_profile(&display_info.0, &display_info.1);
                 {
                     let mut manager_obj_lock = manager_obj.lock().await;
                     manager_obj_lock.monitors = display_info.0;
@@ -221,8 +220,10 @@ impl DisplayManager {
                 }
                 prev_monitor_set = monitor_set;
                 prev_logical_monitor_set = logical_monitor_set;
-                if write_kanshi_profile_if_changed(&profile_name, &profile_text).await? {
-                    reload_kanshi().await?;
+                if let Some((profile_name, profile_text)) = profile {
+                    if write_kanshi_profile_if_changed(&profile_name, &profile_text).await? {
+                        reload_kanshi().await?;
+                    }
                 }
                 Self::emit_monitors_changed().await?;
             }
@@ -394,6 +395,20 @@ fn display_state_changed(
     current_logical_monitors: &HashSet<LogicalMonitor>,
 ) -> bool {
     prev_monitors != current_monitors || prev_logical_monitors != current_logical_monitors
+}
+
+fn observed_profile<T: KanshiProfileEntry>(
+    monitors: &[Monitor],
+    logical_monitors: &[T],
+) -> Option<(String, String)> {
+    if monitors.is_empty() {
+        return None;
+    }
+
+    Some((
+        profile_name_for_monitors(monitors),
+        kanshi_profile_text(monitors, logical_monitors),
+    ))
 }
 
 async fn write_kanshi_profile_if_changed(
@@ -639,7 +654,7 @@ mod tests {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let left = LogicalMonitor::test_new("eDP-1", "ignored", 10, 20, 1.0, 0, true);
+        let left = LogicalMonitor::test_new("eDP-1", "ignored", 10, 20, 1.25, 0, true);
         let right = left.clone();
         let mut left_hash = DefaultHasher::new();
         let mut right_hash = DefaultHasher::new();
@@ -656,12 +671,45 @@ mod tests {
         let current = LogicalMonitor::test_new("HDMI-A-1", "ignored", 10, 20, 1.0, 0, true);
         let empty = HashSet::new();
 
+        assert_ne!(previous, current);
         assert!(display_state_changed(
             &empty,
             &HashSet::from([previous]),
             &empty,
             &HashSet::from([current]),
         ));
+    }
+
+    #[test]
+    fn fractional_scale_is_preserved_in_observed_profile() {
+        let monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let logical = LogicalMonitor::test_new("eDP-1", "ignored", 0, 0, 1.25, 0, true);
+
+        let profile = kanshi_profile_text(&[monitor], &[logical]);
+
+        assert!(profile.contains("scale 1.25 enable"));
+    }
+
+    #[test]
+    fn empty_monitor_transition_does_not_persist_profile() {
+        assert!(observed_profile::<LogicalMonitor>(&[], &[]).is_none());
+        assert!(observed_profile::<LogicalMonitor>(
+            &[Monitor::test_new(
+                "eDP-1",
+                "Regolith",
+                "Panel",
+                "A1",
+                vec![Modes::test_new("1024x768@60Hz")],
+            )],
+            &[],
+        )
+        .is_some());
     }
 
     #[test]
