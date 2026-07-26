@@ -156,6 +156,7 @@ impl PartialEq for LogicalMonitor {
             && self.y_pos == other.y_pos
             && self.scale == other.scale
             && self.transform == other.transform
+            && self.monitors == other.monitors
     }
 }
 
@@ -177,7 +178,7 @@ impl Hash for LogicalMonitor {
         self.transform.hash(state);
         let scale_int = (self.scale * 1000f64) as u32;
         scale_int.hash(state);
-        self.monitors[0].hash(state);
+        self.monitors.hash(state);
     }
 }
 

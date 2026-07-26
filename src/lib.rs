@@ -635,6 +635,36 @@ mod tests {
     }
 
     #[test]
+    fn equal_logical_monitors_have_equal_hashes() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let left = LogicalMonitor::test_new("eDP-1", "ignored", 10, 20, 1.0, 0, true);
+        let right = left.clone();
+        let mut left_hash = DefaultHasher::new();
+        let mut right_hash = DefaultHasher::new();
+        left.hash(&mut left_hash);
+        right.hash(&mut right_hash);
+
+        assert_eq!(left, right);
+        assert_eq!(left_hash.finish(), right_hash.finish());
+    }
+
+    #[test]
+    fn detects_logical_monitor_identity_change_as_change() {
+        let previous = LogicalMonitor::test_new("eDP-1", "ignored", 10, 20, 1.0, 0, true);
+        let current = LogicalMonitor::test_new("HDMI-A-1", "ignored", 10, 20, 1.0, 0, true);
+        let empty = HashSet::new();
+
+        assert!(display_state_changed(
+            &empty,
+            &HashSet::from([previous]),
+            &empty,
+            &HashSet::from([current]),
+        ));
+    }
+
+    #[test]
     fn active_output_with_unknown_mode_is_enabled_not_disabled() {
         let monitor = Monitor::test_new(
             "eDP-1",
