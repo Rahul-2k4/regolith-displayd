@@ -146,8 +146,7 @@ impl Monitor {
 
 impl PartialEq for Monitor {
     fn eq(&self, other: &Self) -> bool {
-        self.description == other.description
-            && self.get_current_mode() == other.get_current_mode()
+        self.description == other.description && self.get_current_mode() == other.get_current_mode()
     }
 }
 
@@ -438,12 +437,21 @@ impl KanshiProfileEntry for LogicalMonitor {
         let config = if mode == "Unknown" {
             format!(
                 "output \"{}\" position {},{} transform {} scale {} enable",
-                dpy_name, self.x_pos, self.y_pos, transform.to_sway(), self.scale
+                dpy_name,
+                self.x_pos,
+                self.y_pos,
+                transform.to_sway(),
+                self.scale
             )
         } else {
             format!(
                 "output \"{}\" mode {} position {},{} transform {} scale {} enable",
-                dpy_name, mode, self.x_pos, self.y_pos, transform.to_sway(), self.scale
+                dpy_name,
+                mode,
+                self.x_pos,
+                self.y_pos,
+                transform.to_sway(),
+                self.scale
             )
         };
         writeln!(kanshi_file, "\t{config}").unwrap();

@@ -589,10 +589,18 @@ mod tests {
     #[test]
     fn detects_current_mode_change_for_same_output_identity() {
         let previous = Monitor::test_new(
-            "eDP-1", "Regolith", "Panel", "A1", vec![Modes::test_new("1024x768@60Hz")],
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
         );
         let current = Monitor::test_new(
-            "eDP-1", "Regolith", "Panel", "A1", vec![Modes::test_new("1920x1080@60Hz")],
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1920x1080@60Hz")],
         );
         let empty = HashSet::new();
 
@@ -610,7 +618,11 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let left = Monitor::test_new(
-            "eDP-1", "Regolith", "Panel", "A1", vec![Modes::test_new("1024x768@60Hz")],
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
         );
         let right = left.clone();
         let mut left_hash = DefaultHasher::new();
