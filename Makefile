@@ -6,4 +6,5 @@ build:
 	CARGO_HOME=debian/tmp_files/.cargo cargo build --release --manifest-path "$(MANIFEST_PATH)"
 
 clean:
+	rm -rf debian/tmp_files/.cargo
 	cargo clean --manifest-path "$(MANIFEST_PATH)"
