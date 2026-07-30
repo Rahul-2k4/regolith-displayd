@@ -272,10 +272,38 @@ impl DisplayManager {
         Ok((monitors, logical_monitors))
     }
 
+    pub async fn apply_wayland_snapshot(
+        manager_obj: Arc<Mutex<DisplayManager>>,
+        snapshot: &OutputSnapshot,
+    ) -> Result<bool, Box<dyn Error>> {
+        let (changed, profile) = {
+            let mut manager = manager_obj.lock().await;
+            let previous_monitors = manager.monitors.clone();
+            let previous_logical = manager.logical_monitors.clone();
+            manager.replace_from_wayland_snapshot(snapshot)?;
+            let changed = previous_monitors != manager.monitors
+                || previous_logical != manager.logical_monitors;
+            let profile = changed
+                .then(|| observed_profile(&manager.monitors, &manager.logical_monitors))
+                .flatten();
+            (changed, profile)
+        };
+        if !changed {
+            return Ok(false);
+        }
+        if let Some((name, text)) = profile {
+            if write_kanshi_profile_if_changed(&name, &text).await? {
+                reload_kanshi().await?;
+            }
+        }
+        Self::emit_monitors_changed().await?;
+        Ok(true)
+    }
+
     pub fn replace_from_wayland_snapshot(
         &mut self,
         snapshot: &OutputSnapshot,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         for head in snapshot.heads.iter().filter(|head| head.enabled) {
             if head.scale.is_none() {
                 return Err(format!(
@@ -304,10 +332,11 @@ impl DisplayManager {
             .filter_map(LogicalMonitor::from_snapshot)
             .collect();
 
+        let changed = self.monitors != monitors || self.logical_monitors != logical_monitors;
         self.serial = snapshot.serial;
         self.monitors = monitors;
         self.logical_monitors = logical_monitors;
-        Ok(())
+        Ok(changed)
     }
 }
 
@@ -616,7 +645,8 @@ mod tests {
             )],
         };
 
-        manager.replace_from_wayland_snapshot(&snapshot).unwrap();
+        assert!(manager.replace_from_wayland_snapshot(&snapshot).unwrap());
+        assert!(!manager.replace_from_wayland_snapshot(&snapshot).unwrap());
 
         assert_eq!(manager.serial, 42);
         assert_eq!(manager.monitors.len(), 1);

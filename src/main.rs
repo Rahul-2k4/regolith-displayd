@@ -5,7 +5,11 @@ use regolith_displayd::wayland_observer::{
 use regolith_displayd::{DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc, time::Duration};
 use swayipc_async::Connection as SwayConection;
-use tokio::{sync::Mutex, task::JoinHandle, try_join};
+use tokio::{
+    sync::{oneshot, Mutex},
+    task::JoinHandle,
+    try_join,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -15,8 +19,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let manager_ref = Arc::new(Mutex::new(manager));
     let sway_connection_ref = connect_sway_backend().await?;
 
-    let wayland_observer_handle = if sway_connection_ref.is_none() {
+    let wayland_observer = if sway_connection_ref.is_none() {
         start_wayland_state_observer(Arc::clone(&manager_ref))
+    } else {
+        None
+    };
+
+    let wayland_observer_handle = if let Some((handle, ready)) = wayland_observer {
+        ready
+            .await
+            .map_err(|_| "Wayland observer readiness channel closed")??;
+        Some(handle)
     } else {
         None
     };
@@ -81,7 +94,7 @@ async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box
     );
     if cosmic {
         warn!(
-            "{message}; continuing without the Sway backend and switching to Wayland output observation for in-memory state updates only; continuous persistence is still pending"
+            "{message}; continuing without the Sway backend and switching to Wayland output observation"
         );
         Ok(None)
     } else {
@@ -89,20 +102,20 @@ async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box
     }
 }
 
-fn start_wayland_state_observer(manager_ref: Arc<Mutex<DisplayManager>>) -> Option<JoinHandle<()>> {
+fn start_wayland_state_observer(
+    manager_ref: Arc<Mutex<DisplayManager>>,
+) -> Option<(JoinHandle<()>, oneshot::Receiver<Result<(), String>>)> {
     match WaylandOutputObserver::observe() {
         Ok(receiver) => {
-            info!(
-                "Starting Wayland output observation for COSMIC without Sway; this updates DisplayManager state only and continuous persistence is still pending"
-            );
-            Some(tokio::task::spawn_blocking(move || {
-                consume_wayland_observer(manager_ref, receiver);
-            }))
+            let (ready_sender, ready_receiver) = oneshot::channel();
+            info!("Starting Wayland output observation for COSMIC without Sway");
+            let handle = tokio::task::spawn_blocking(move || {
+                consume_wayland_observer(manager_ref, receiver, Some(ready_sender));
+            });
+            Some((handle, ready_receiver))
         }
         Err(error) => {
-            warn!(
-                "Wayland output observation unavailable at startup: {error}; keeping empty/prior state"
-            );
+            warn!("Wayland output observation unavailable at startup: {error}");
             None
         }
     }
@@ -111,40 +124,40 @@ fn start_wayland_state_observer(manager_ref: Arc<Mutex<DisplayManager>>) -> Opti
 fn consume_wayland_observer(
     manager_ref: Arc<Mutex<DisplayManager>>,
     receiver: std::sync::mpsc::Receiver<Result<OutputSnapshot, WaylandObserverError>>,
+    mut ready_sender: Option<oneshot::Sender<Result<(), String>>>,
 ) {
     let runtime = tokio::runtime::Handle::current();
 
-    // COSMIC fallback only updates in-memory DisplayManager state here.
-    // Writing persistence artifacts remains out of scope for this slice.
+    // COSMIC snapshots use the same persistence and signal path as Sway observations.
     while let Ok(result) = receiver.recv() {
         match result {
-            Ok(snapshot) => apply_wayland_snapshot(&runtime, &manager_ref, snapshot),
+            Ok(snapshot) => {
+                let result = runtime.block_on(DisplayManager::apply_wayland_snapshot(
+                    Arc::clone(&manager_ref),
+                    &snapshot,
+                ));
+                if result.is_ok() {
+                    if let Some(sender) = ready_sender.take() {
+                        let _ = sender.send(Ok(()));
+                    }
+                } else if let Err(error) = result {
+                    warn!(
+                        "Rejected Wayland display snapshot serial {}: {}",
+                        snapshot.serial, error
+                    );
+                }
+            }
             Err(error) => {
-                warn!(
-                    "Wayland output observation stopped after state-only updates: {error}; continuous persistence is still pending"
-                );
+                warn!("Wayland output observation stopped: {error}");
+                if let Some(sender) = ready_sender.take() {
+                    let _ = sender.send(Err(error.to_string()));
+                }
                 break;
             }
         }
     }
 
     info!("Wayland output observation receiver closed; state-only loop exiting");
-}
-
-fn apply_wayland_snapshot(
-    runtime: &tokio::runtime::Handle,
-    manager_ref: &Arc<Mutex<DisplayManager>>,
-    snapshot: OutputSnapshot,
-) {
-    runtime.block_on(async {
-        let mut manager = manager_ref.lock().await;
-        if let Err(error) = manager.replace_from_wayland_snapshot(&snapshot) {
-            warn!(
-                "Rejected incomplete Wayland display snapshot serial {}: {error}; keeping prior state",
-                snapshot.serial
-            );
-        }
-    });
 }
 
 #[cfg(test)]
