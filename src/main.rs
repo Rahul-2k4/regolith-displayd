@@ -1,4 +1,5 @@
 use log::{error, warn};
+use regolith_displayd::wayland_observer::WaylandOutputObserver;
 use regolith_displayd::{DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc, time::Duration};
 use swayipc_async::Connection as SwayConection;
@@ -11,6 +12,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let manager = DisplayManager::new().await;
     let manager_ref = Arc::new(Mutex::new(manager));
     let sway_connection_ref = connect_sway_backend().await?;
+
+    if sway_connection_ref.is_none() {
+        match tokio::task::spawn_blocking(WaylandOutputObserver::collect_current).await {
+            Ok(Ok(snapshot)) => {
+                let mut manager = manager_ref.lock().await;
+                if let Err(error) = manager.replace_from_wayland_snapshot(&snapshot) {
+                    warn!(
+                        "Rejected incomplete Wayland display snapshot: {error}; keeping prior state"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                warn!(
+                    "Wayland display snapshot unavailable at startup: {error}; keeping empty/prior state"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    "Wayland display observer task failed at startup: {error}; keeping empty/prior state"
+                );
+            }
+        }
+    }
 
     let server = DisplayServer::new(Arc::clone(&manager_ref), sway_connection_ref.clone()).await;
     server.run_server().await?;
@@ -63,7 +87,7 @@ async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box
         last_error.unwrap_or_else(|| "unknown error".to_string())
     );
     if cosmic {
-        warn!("{message}; continuing without the Sway backend; Wayland observer integration remains pending");
+        warn!("{message}; continuing without the Sway backend; attempting a one-shot Wayland startup snapshot");
         Ok(None)
     } else {
         Err(message.into())
