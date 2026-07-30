@@ -2,7 +2,7 @@ use log::{error, info, warn};
 use regolith_displayd::wayland_observer::{
     OutputSnapshot, WaylandObserverError, WaylandOutputObserver,
 };
-use regolith_displayd::{DisplayManager, DisplayServer};
+use regolith_displayd::{wayland_side_effects_required, DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc, time::Duration};
 use swayipc_async::Connection as SwayConection;
 use tokio::{
@@ -128,23 +128,32 @@ fn consume_wayland_observer(
 ) {
     let runtime = tokio::runtime::Handle::current();
 
+    let mut pending_side_effects = false;
     // COSMIC snapshots use the same persistence and signal path as Sway observations.
     while let Ok(result) = receiver.recv() {
         match result {
             Ok(snapshot) => {
-                let result = runtime.block_on(DisplayManager::apply_wayland_snapshot(
+                let install = runtime.block_on(DisplayManager::install_wayland_snapshot(
                     Arc::clone(&manager_ref),
                     &snapshot,
                 ));
-                if result.is_ok() {
-                    if let Some(sender) = ready_sender.take() {
-                        let _ = sender.send(Ok(()));
+                match install {
+                    Ok(state_changed) => {
+                        if let Some(sender) = ready_sender.take() {
+                            let _ = sender.send(Ok(()));
+                        }
+                        if wayland_side_effects_required(state_changed, pending_side_effects) {
+                            pending_side_effects = runtime.block_on(
+                                DisplayManager::persist_wayland_state(Arc::clone(&manager_ref)),
+                            );
+                        }
                     }
-                } else if let Err(error) = result {
-                    warn!(
-                        "Rejected Wayland display snapshot serial {}: {}",
-                        snapshot.serial, error
-                    );
+                    Err(error) => {
+                        warn!(
+                            "Wayland snapshot rejected for serial {}: {}",
+                            snapshot.serial, error
+                        );
+                    }
                 }
             }
             Err(error) => {

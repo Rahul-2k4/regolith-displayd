@@ -31,6 +31,10 @@ pub struct DisplayManager {
     properties: DisplayManagerProperties,
 }
 
+pub fn wayland_side_effects_required(state_changed: bool, pending_side_effects: bool) -> bool {
+    state_changed || pending_side_effects
+}
+
 /// DBus Interface for providing bindings
 pub struct DisplayServer {
     manager: Arc<Mutex<DisplayManager>>,
@@ -272,32 +276,39 @@ impl DisplayManager {
         Ok((monitors, logical_monitors))
     }
 
-    pub async fn apply_wayland_snapshot(
+    pub async fn install_wayland_snapshot(
         manager_obj: Arc<Mutex<DisplayManager>>,
         snapshot: &OutputSnapshot,
-    ) -> Result<bool, Box<dyn Error>> {
-        let (changed, profile) = {
-            let mut manager = manager_obj.lock().await;
-            let previous_monitors = manager.monitors.clone();
-            let previous_logical = manager.logical_monitors.clone();
-            manager.replace_from_wayland_snapshot(snapshot)?;
-            let changed = previous_monitors != manager.monitors
-                || previous_logical != manager.logical_monitors;
-            let profile = changed
-                .then(|| observed_profile(&manager.monitors, &manager.logical_monitors))
-                .flatten();
-            (changed, profile)
+    ) -> Result<bool, String> {
+        let mut manager = manager_obj.lock().await;
+        manager.replace_from_wayland_snapshot(snapshot)
+    }
+
+    pub async fn persist_wayland_state(manager_obj: Arc<Mutex<DisplayManager>>) -> bool {
+        let profile = {
+            let manager = manager_obj.lock().await;
+            observed_profile(&manager.monitors, &manager.logical_monitors)
         };
-        if !changed {
-            return Ok(false);
-        }
         if let Some((name, text)) = profile {
-            if write_kanshi_profile_if_changed(&name, &text).await? {
-                reload_kanshi().await?;
+            match write_kanshi_profile_if_changed(&name, &text).await {
+                Ok(true) => {
+                    if let Err(error) = reload_kanshi().await {
+                        error!("Error reloading kanshi configuration: {}", error);
+                        return true;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    error!("Error writing data to kanshi config file: {}", error);
+                    return true;
+                }
             }
         }
-        Self::emit_monitors_changed().await?;
-        Ok(true)
+        if let Err(error) = Self::emit_monitors_changed().await {
+            error!("Error emitting MonitorsChanged: {}", error);
+            return true;
+        }
+        false
     }
 
     pub fn replace_from_wayland_snapshot(
@@ -339,7 +350,6 @@ impl DisplayManager {
         Ok(changed)
     }
 }
-
 impl DisplayManagerProperties {
     pub fn new() -> DisplayManagerProperties {
         DisplayManagerProperties {
@@ -657,6 +667,13 @@ mod tests {
             manager.logical_monitors[0],
             LogicalMonitor::test_new("HDMI-A-1", "", 100, 200, 1.5, 0, false)
         );
+    }
+
+    #[test]
+    fn retries_side_effects_after_a_failed_prior_attempt() {
+        assert!(!wayland_side_effects_required(false, false));
+        assert!(wayland_side_effects_required(true, false));
+        assert!(wayland_side_effects_required(false, true));
     }
 
     #[test]
