@@ -132,7 +132,7 @@ impl DisplayServer {
     #[dbus_interface(property)]
     pub async fn apply_monitors_config_allowed(&self) -> bool {
         info!("Call to apply_monitors_config");
-        return true;
+        self.sway_connection.is_some()
     }
 
     #[dbus_interface(signal)]
@@ -467,6 +467,14 @@ mod tests {
             Err(zbus::fdo::Error::Failed(message))
                 if message == "Sway IPC backend is unavailable"
         ));
+    }
+
+    #[tokio::test]
+    async fn apply_monitors_config_is_not_allowed_without_sway_connection() {
+        let manager = Arc::new(Mutex::new(DisplayManager::new().await));
+        let server = DisplayServer::new(manager, None).await;
+
+        assert!(!server.apply_monitors_config_allowed().await);
     }
 
     fn build_manager(
