@@ -1,5 +1,6 @@
 pub mod modes;
 pub mod monitor;
+pub mod wayland_observer;
 
 use core::fmt;
 use lazy_static::lazy_static;
