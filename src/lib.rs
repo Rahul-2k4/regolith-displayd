@@ -16,6 +16,8 @@ use tokio::sync::Mutex;
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
+use crate::wayland_observer::OutputSnapshot;
+
 lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
 }
@@ -269,6 +271,44 @@ impl DisplayManager {
             .collect();
         Ok((monitors, logical_monitors))
     }
+
+    pub fn replace_from_wayland_snapshot(
+        &mut self,
+        snapshot: &OutputSnapshot,
+    ) -> Result<(), String> {
+        for head in snapshot.heads.iter().filter(|head| head.enabled) {
+            if head.scale.is_none() {
+                return Err(format!(
+                    "Wayland snapshot missing scale for enabled output {}",
+                    head.name
+                ));
+            }
+            if head.position.is_none() {
+                return Err(format!(
+                    "Wayland snapshot missing position for enabled output {}",
+                    head.name
+                ));
+            }
+            if head.transform.is_none() {
+                return Err(format!(
+                    "Wayland snapshot missing transform for enabled output {}",
+                    head.name
+                ));
+            }
+        }
+
+        let monitors = snapshot.heads.iter().map(Monitor::from_snapshot).collect();
+        let logical_monitors = snapshot
+            .heads
+            .iter()
+            .filter_map(LogicalMonitor::from_snapshot)
+            .collect();
+
+        self.serial = snapshot.serial;
+        self.monitors = monitors;
+        self.logical_monitors = logical_monitors;
+        Ok(())
+    }
 }
 
 impl DisplayManagerProperties {
@@ -444,6 +484,7 @@ mod tests {
     use super::*;
     use crate::modes::Modes;
     use crate::monitor::{LogicalMonitor, Monitor, MonitorApply};
+    use crate::wayland_observer::{OutputHeadSnapshot, OutputModeSnapshot, OutputSnapshot};
 
     #[tokio::test]
     async fn run_server_without_sway_connection_registers_dbus_server() {
@@ -489,6 +530,40 @@ mod tests {
         }
     }
 
+    fn snapshot_head(
+        name: &str,
+        enabled: bool,
+        position: Option<(i32, i32)>,
+        transform: Option<u32>,
+        scale: Option<f64>,
+        width: i32,
+        height: i32,
+        refresh_mhz: Option<i32>,
+    ) -> OutputHeadSnapshot {
+        OutputHeadSnapshot {
+            name: name.to_string(),
+            description: Some(format!("{name} description")),
+            enabled,
+            position,
+            transform,
+            scale,
+            current_mode: Some(OutputModeSnapshot {
+                width,
+                height,
+                refresh_mhz,
+                preferred: true,
+                current: true,
+            }),
+            modes: vec![OutputModeSnapshot {
+                width,
+                height,
+                refresh_mhz,
+                preferred: true,
+                current: true,
+            }],
+        }
+    }
+
     #[test]
     fn renders_active_and_disabled_outputs() {
         let active_mode = Modes::test_new("1024x768@60Hz");
@@ -522,6 +597,185 @@ mod tests {
 \toutput \"Projector Room B2\" disable\n\
 }\n"
         );
+    }
+
+    #[test]
+    fn replaces_manager_state_from_single_wayland_snapshot() {
+        let mut manager = build_manager(Vec::new(), Vec::new());
+        let snapshot = OutputSnapshot {
+            serial: 42,
+            heads: vec![snapshot_head(
+                "HDMI-A-1",
+                true,
+                Some((100, 200)),
+                Some(0),
+                Some(1.5),
+                2560,
+                1440,
+                Some(144_000),
+            )],
+        };
+
+        manager.replace_from_wayland_snapshot(&snapshot).unwrap();
+
+        assert_eq!(manager.serial, 42);
+        assert_eq!(manager.monitors.len(), 1);
+        assert_eq!(manager.logical_monitors.len(), 1);
+        assert_eq!(manager.monitors[0].get_dpy_name(), "HDMI-A-1");
+        assert_eq!(manager.monitors[0].get_current_mode(), "2560x1440@144Hz");
+        assert_eq!(
+            manager.logical_monitors[0],
+            LogicalMonitor::test_new("HDMI-A-1", "", 100, 200, 1.5, 0, false)
+        );
+    }
+
+    #[test]
+    fn preserves_snapshot_head_order_when_replacing_manager_state() {
+        let mut manager = build_manager(Vec::new(), Vec::new());
+        let snapshot = OutputSnapshot {
+            serial: 7,
+            heads: vec![
+                snapshot_head(
+                    "DP-1",
+                    true,
+                    Some((0, 0)),
+                    Some(0),
+                    Some(1.0),
+                    2256,
+                    1504,
+                    Some(60_000),
+                ),
+                snapshot_head(
+                    "HDMI-A-1",
+                    false,
+                    None,
+                    Some(0),
+                    None,
+                    1920,
+                    1080,
+                    Some(60_000),
+                ),
+                snapshot_head(
+                    "eDP-1",
+                    true,
+                    Some((2256, 0)),
+                    Some(0),
+                    Some(1.25),
+                    2880,
+                    1800,
+                    Some(90_000),
+                ),
+            ],
+        };
+
+        manager.replace_from_wayland_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            manager
+                .monitors
+                .iter()
+                .map(|monitor| monitor.get_dpy_name())
+                .collect::<Vec<_>>(),
+            vec![
+                "DP-1".to_string(),
+                "HDMI-A-1".to_string(),
+                "eDP-1".to_string()
+            ]
+        );
+        assert_eq!(
+            manager
+                .logical_monitors
+                .iter()
+                .map(|logical| logical.get_dpy_name())
+                .collect::<Vec<_>>(),
+            vec!["DP-1".to_string(), "eDP-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_wayland_refresh_keeps_current_mode_unknown_and_omits_kanshi_mode_line() {
+        let mut manager = build_manager(Vec::new(), Vec::new());
+        let snapshot = OutputSnapshot {
+            serial: 9,
+            heads: vec![snapshot_head(
+                "DP-6",
+                true,
+                Some((10, 20)),
+                Some(0),
+                Some(1.0),
+                3440,
+                1440,
+                None,
+            )],
+        };
+
+        manager.replace_from_wayland_snapshot(&snapshot).unwrap();
+
+        assert_eq!(manager.monitors[0].get_current_mode(), "Unknown");
+        assert_eq!(
+            kanshi_profile_text(&manager.monitors, &manager.logical_monitors),
+            "profile {\n\
+\toutput \"DP-6\" position 10,20 transform normal scale 1 enable\n\
+}\n"
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_enabled_wayland_snapshot_without_mutating_state_or_profile() {
+        let active_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let disabled_monitor = Monitor::test_new(
+            "HDMI-A-1",
+            "Projector",
+            "Room",
+            "B2",
+            vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let mut manager = build_manager(
+            vec![active_monitor, disabled_monitor],
+            vec![LogicalMonitor::test_new(
+                "eDP-1",
+                "1024x768@60Hz",
+                10,
+                20,
+                1.0,
+                0,
+                true,
+            )],
+        );
+        let previous_manager = manager.clone();
+        let previous_profile = kanshi_profile_text(&manager.monitors, &manager.logical_monitors);
+        let snapshot = OutputSnapshot {
+            serial: 42,
+            heads: vec![snapshot_head(
+                "eDP-1",
+                true,
+                Some((100, 200)),
+                Some(0),
+                None,
+                2560,
+                1440,
+                Some(144_000),
+            )],
+        };
+
+        let result = manager.replace_from_wayland_snapshot(&snapshot);
+
+        assert_eq!(
+            result,
+            Err("Wayland snapshot missing scale for enabled output eDP-1".to_string())
+        );
+        assert_eq!(manager, previous_manager);
+        assert_eq!(
+            kanshi_profile_text(&manager.monitors, &manager.logical_monitors),
+            previous_profile
+        );
+        assert!(!previous_profile.contains("output \"Regolith Panel A1\" disable"));
     }
 
     #[test]
