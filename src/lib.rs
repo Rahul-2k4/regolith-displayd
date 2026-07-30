@@ -32,7 +32,7 @@ pub struct DisplayManager {
 pub struct DisplayServer {
     manager: Arc<Mutex<DisplayManager>>,
     // TODO: Make independent of sway
-    sway_connection: Arc<Mutex<Connection>>,
+    sway_connection: Option<Arc<Mutex<Connection>>>,
 }
 
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
@@ -74,6 +74,9 @@ impl DisplayServer {
         properties: DisplayManagerProperties,
     ) -> zbus::fdo::Result<()> {
         debug!("Configuration Method: {method}");
+        let sway_connection = self.sway_connection.as_ref().ok_or_else(|| {
+            zbus::fdo::Error::Failed(String::from("Sway IPC backend is unavailable"))
+        })?;
         let mut manager_obj = self.manager.lock().await;
         debug!("Serial: {} {}", manager_obj.serial, serial);
         if serial != manager_obj.serial {
@@ -84,7 +87,7 @@ impl DisplayServer {
         for mutter_logical_mointor in &mutter_logical_monitors {
             // If apply_monitors_config called with method == 0 (Verify configuration)
             if method == 0 {
-                match mutter_logical_mointor.verify(&self.sway_connection, &manager_obj.monitors) {
+                match mutter_logical_mointor.verify(sway_connection, &manager_obj.monitors) {
                     Ok(_) => {
                         continue;
                     }
@@ -118,7 +121,7 @@ impl DisplayServer {
                 error!("Error reloading kanshi configuration: {e}");
             }
         }
-        if let Err(e) = manager_obj.get_monitor_info(&self.sway_connection).await {
+        if let Err(e) = manager_obj.get_monitor_info(sway_connection).await {
             error!("Error getting output information from sway: {e}");
         }
         DisplayManager::emit_monitors_changed().await?;
@@ -138,7 +141,7 @@ impl DisplayServer {
 impl DisplayServer {
     pub async fn new(
         manager: Arc<Mutex<DisplayManager>>,
-        sway_connection: Arc<Mutex<Connection>>,
+        sway_connection: Option<Arc<Mutex<Connection>>>,
     ) -> DisplayServer {
         DisplayServer {
             manager,
@@ -147,11 +150,13 @@ impl DisplayServer {
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
-        self.manager
-            .lock()
-            .await
-            .get_monitor_info(&self.sway_connection)
-            .await?;
+        if let Some(sway_connection) = &self.sway_connection {
+            self.manager
+                .lock()
+                .await
+                .get_monitor_info(sway_connection)
+                .await?;
+        }
 
         let mut connection = ZBUS_CONNECTION.lock().await;
         *connection = Some(
@@ -176,8 +181,11 @@ impl DisplayManager {
 
     pub async fn watch_changes(
         manager_obj: Arc<Mutex<DisplayManager>>,
-        sway_connection: Arc<Mutex<Connection>>,
+        sway_connection: Option<Arc<Mutex<Connection>>>,
     ) -> Result<(), Box<dyn Error>> {
+        let Some(sway_connection) = sway_connection else {
+            return Ok(());
+        };
         let display_info = {
             let mut manager_obj_lock = manager_obj.lock().await;
             manager_obj_lock.get_monitor_info(&sway_connection).await?
@@ -249,7 +257,7 @@ impl DisplayManager {
     /// Returns list of all monitors and logical monitors
     pub async fn get_monitor_info<'a>(
         &mut self,
-        sway_connection: &Mutex<Connection>,
+        sway_connection: &Arc<Mutex<Connection>>,
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
         let monitors = outputs.iter().map(|o| Monitor::new(o)).collect();
@@ -435,6 +443,30 @@ mod tests {
     use super::*;
     use crate::modes::Modes;
     use crate::monitor::{LogicalMonitor, Monitor, MonitorApply};
+
+    #[tokio::test]
+    async fn run_server_without_sway_connection_registers_dbus_server() {
+        let manager = Arc::new(Mutex::new(DisplayManager::new().await));
+        let server = DisplayServer::new(manager, None).await;
+
+        assert!(server.run_server().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_without_sway_connection_returns_backend_error() {
+        let manager = Arc::new(Mutex::new(DisplayManager::new().await));
+        let mut server = DisplayServer::new(manager, None).await;
+
+        let result = server
+            .apply_monitors_config(0, 0, Vec::new(), DisplayManagerProperties::new())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(zbus::fdo::Error::Failed(message))
+                if message == "Sway IPC backend is unavailable"
+        ));
+    }
 
     fn build_manager(
         monitors: Vec<Monitor>,

@@ -1,4 +1,4 @@
-use log::error;
+use log::{error, warn};
 use regolith_displayd::{DisplayManager, DisplayServer};
 use std::{error::Error, future::pending, sync::Arc};
 use swayipc_async::Connection as SwayConection;
@@ -10,13 +10,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // New pointer to Display Manager Object
     let manager = DisplayManager::new().await;
     let manager_ref = Arc::new(Mutex::new(manager));
-    let sway_connection = SwayConection::new().await.expect(
-        "Unable to connect to sway ipc interface. Make sure sway is running and SWAYSOCK is set",
-    );
-    let sway_connection_ref = Arc::new(Mutex::new(sway_connection));
-    let server =
-        DisplayServer::new(Arc::clone(&manager_ref), Arc::clone(&sway_connection_ref)).await;
-    server.run_server().await.unwrap();
+    let sway_connection_ref = SwayConection::new()
+        .await
+        .ok()
+        .map(|connection| Arc::new(Mutex::new(connection)));
+    if sway_connection_ref.is_none() {
+        warn!("Sway IPC backend unavailable; continuing without Sway display observation");
+    }
+
+    let server = DisplayServer::new(Arc::clone(&manager_ref), sway_connection_ref.clone()).await;
+    server.run_server().await?;
 
     let watch_handle = tokio::spawn(async move {
         DisplayManager::watch_changes(manager_ref, sway_connection_ref)
