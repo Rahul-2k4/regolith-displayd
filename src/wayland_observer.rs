@@ -7,12 +7,14 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 use wayland_client::{
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
     protocol::wl_registry,
-    Connection, Dispatch, Proxy, QueueHandle,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 use wayland_protocols_wlr::output_management::v1::client::{
     zwlr_output_head_v1, zwlr_output_head_v1::ZwlrOutputHeadV1, zwlr_output_manager_v1,
@@ -76,7 +78,9 @@ pub enum WaylandObserverError {
     UnsupportedGlobal { name: &'static str },
     /// Dispatching Wayland events failed.
     DispatchFailed(String),
-    /// The compositor destroyed the output manager before a publishable snapshot arrived.
+    /// Spawning the dedicated observation thread failed.
+    ThreadSpawnFailed(String),
+    /// The compositor destroyed the output manager and observation cannot continue.
     ManagerFinished,
     /// Internal snapshot state became inconsistent while processing protocol events.
     StateViolation(String),
@@ -93,9 +97,10 @@ impl fmt::Display for WaylandObserverError {
                 write!(f, "Required Wayland global is unavailable: {name}")
             }
             Self::DispatchFailed(message) => write!(f, "Wayland dispatch failed: {message}"),
-            Self::ManagerFinished => {
-                write!(f, "Wayland output manager finished before publication")
+            Self::ThreadSpawnFailed(message) => {
+                write!(f, "Wayland observer thread spawn failed: {message}")
             }
+            Self::ManagerFinished => write!(f, "Wayland output manager finished observation"),
             Self::StateViolation(message) => {
                 write!(f, "Wayland observer state violation: {message}")
             }
@@ -110,6 +115,42 @@ impl std::error::Error for WaylandObserverError {}
 pub struct WaylandOutputObserver;
 
 impl WaylandOutputObserver {
+    /// Connect to the compositor referenced by the current environment and start
+    /// a dedicated blocking observation thread that forwards every
+    /// `zwlr_output_manager_v1.done` snapshot through the returned receiver.
+    pub fn observe(
+    ) -> Result<Receiver<Result<OutputSnapshot, WaylandObserverError>>, WaylandObserverError> {
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let (publication_tx, publication_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name("wayland-output-observer".to_string())
+            .spawn(move || {
+                let startup = Self::connect_and_bind();
+                let (connection, mut queue, mut state) = match startup {
+                    Ok(parts) => {
+                        let _ = startup_tx.send(Ok(()));
+                        parts
+                    }
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error));
+                        return;
+                    }
+                };
+
+                Self::run_observer_loop(connection, &mut queue, &mut state, publication_tx);
+            })
+            .map_err(|error| WaylandObserverError::ThreadSpawnFailed(error.to_string()))?;
+
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok(publication_rx),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(WaylandObserverError::DispatchFailed(format!(
+                "observer startup channel closed unexpectedly: {error}"
+            ))),
+        }
+    }
+
     /// Connect to the compositor referenced by the current environment and return
     /// the first immutable snapshot published by `zwlr_output_manager_v1.done`.
     pub fn collect_current() -> Result<OutputSnapshot, WaylandObserverError> {
@@ -121,7 +162,30 @@ impl WaylandOutputObserver {
     fn collect_from_connection(
         connection: &Connection,
     ) -> Result<OutputSnapshot, WaylandObserverError> {
-        let (globals, mut queue) = registry_queue_init::<ObserverState>(connection)
+        let (mut queue, mut state) = Self::connect_and_bind_from_connection(connection)?;
+
+        loop {
+            if let Some(result) = state.take_next_result() {
+                return result;
+            }
+            queue
+                .blocking_dispatch(&mut state)
+                .map_err(|error| WaylandObserverError::DispatchFailed(error.to_string()))?;
+        }
+    }
+
+    fn connect_and_bind(
+    ) -> Result<(Connection, EventQueue<ObserverState>, ObserverState), WaylandObserverError> {
+        let connection = Connection::connect_to_env()
+            .map_err(|error| WaylandObserverError::ConnectionFailed(error.to_string()))?;
+        let (queue, state) = Self::connect_and_bind_from_connection(&connection)?;
+        Ok((connection, queue, state))
+    }
+
+    fn connect_and_bind_from_connection(
+        connection: &Connection,
+    ) -> Result<(EventQueue<ObserverState>, ObserverState), WaylandObserverError> {
+        let (globals, queue) = registry_queue_init::<ObserverState>(connection)
             .map_err(|error| WaylandObserverError::GlobalDiscoveryFailed(error.to_string()))?;
         let manager: ZwlrOutputManagerV1 =
             globals.bind(&queue.handle(), 1..=4, ()).map_err(|_| {
@@ -130,21 +194,29 @@ impl WaylandOutputObserver {
                 }
             })?;
 
-        let mut state = ObserverState {
+        let state = ObserverState {
             _manager: Some(manager),
             ..ObserverState::default()
         };
 
+        Ok((queue, state))
+    }
+
+    fn run_observer_loop(
+        _connection: Connection,
+        queue: &mut EventQueue<ObserverState>,
+        state: &mut ObserverState,
+        publication_tx: Sender<Result<OutputSnapshot, WaylandObserverError>>,
+    ) {
         loop {
-            if let Some(snapshot) = state.collector.take_publication() {
-                return Ok(snapshot);
+            let publish_status = publish_pending_results(state, &publication_tx);
+            if publish_status.should_stop() {
+                break;
             }
-            if let Some(error) = state.terminal_error.take() {
-                return Err(error);
+
+            if let Err(error) = queue.blocking_dispatch(state) {
+                state.store_terminal(WaylandObserverError::DispatchFailed(error.to_string()));
             }
-            queue
-                .blocking_dispatch(&mut state)
-                .map_err(|error| WaylandObserverError::DispatchFailed(error.to_string()))?;
         }
     }
 }
@@ -154,13 +226,33 @@ struct ObserverState {
     collector: SnapshotCollector,
     _manager: Option<ZwlrOutputManagerV1>,
     terminal_error: Option<WaylandObserverError>,
+    terminal_reached: bool,
 }
 
 impl ObserverState {
     fn store_error(&mut self, error: SnapshotStateError) {
-        if self.terminal_error.is_none() {
-            self.terminal_error = Some(error.into());
+        self.store_terminal(error.into());
+    }
+
+    fn store_terminal(&mut self, error: WaylandObserverError) {
+        if self.terminal_reached {
+            return;
         }
+
+        self.terminal_reached = true;
+        self.terminal_error = Some(error);
+    }
+
+    fn take_next_result(&mut self) -> Option<Result<OutputSnapshot, WaylandObserverError>> {
+        if let Some(snapshot) = self.collector.take_publication() {
+            return Some(Ok(snapshot));
+        }
+
+        self.terminal_error.take().map(Err)
+    }
+
+    fn terminal_drained(&self) -> bool {
+        self.terminal_reached && self.terminal_error.is_none()
     }
 }
 
@@ -195,9 +287,7 @@ impl Dispatch<ZwlrOutputManagerV1, ()> for ObserverState {
                 }
             }
             zwlr_output_manager_v1::Event::Finished => {
-                if state.collector.publication_count() == 0 && state.terminal_error.is_none() {
-                    state.terminal_error = Some(WaylandObserverError::ManagerFinished);
-                }
+                state.store_terminal(WaylandObserverError::ManagerFinished);
             }
             _ => {}
         }
@@ -451,11 +541,6 @@ impl SnapshotCollector {
             .push_back(OutputSnapshot { serial, heads });
         Ok(())
     }
-
-    fn publication_count(&self) -> usize {
-        self.publications.len()
-    }
-
     fn take_publication(&mut self) -> Option<OutputSnapshot> {
         self.publications.pop_front()
     }
@@ -475,6 +560,35 @@ impl SnapshotCollector {
             .modes
             .get_mut(&mode_id)
             .ok_or(SnapshotStateError::UnknownMode(mode_id))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishStatus {
+    Continue,
+    Stop,
+}
+
+impl PublishStatus {
+    fn should_stop(self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
+fn publish_pending_results(
+    state: &mut ObserverState,
+    publication_tx: &Sender<Result<OutputSnapshot, WaylandObserverError>>,
+) -> PublishStatus {
+    while let Some(result) = state.take_next_result() {
+        if publication_tx.send(result).is_err() {
+            return PublishStatus::Stop;
+        }
+    }
+
+    if state.terminal_drained() {
+        PublishStatus::Stop
+    } else {
+        PublishStatus::Continue
     }
 }
 
@@ -584,7 +698,11 @@ fn normalize_scale(scale: f64) -> Result<f64, SnapshotStateError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_scale, SnapshotCollector};
+    use super::{
+        normalize_scale, publish_pending_results, ObserverState, OutputSnapshot, PublishStatus,
+        SnapshotCollector, WaylandObserverError,
+    };
+    use std::sync::mpsc;
 
     #[test]
     fn normalizes_scale_without_losing_fractional_values() {
@@ -645,21 +763,112 @@ mod tests {
         let mut collector = SnapshotCollector::default();
         collector.note_head(1);
         collector.set_head_name(1, "eDP-1".to_string()).unwrap();
-        assert_eq!(collector.publication_count(), 0);
+        assert_eq!(collector.publications.len(), 0);
 
         collector.note_mode(1, 20).unwrap();
         collector.set_mode_size(20, 2256, 1504).unwrap();
-        assert_eq!(collector.publication_count(), 0);
+        assert_eq!(collector.publications.len(), 0);
 
         collector.publish_done(1).unwrap();
-        assert_eq!(collector.publication_count(), 1);
+        assert_eq!(collector.publications.len(), 1);
 
         collector
             .set_head_description(1, "Internal display".to_string())
             .unwrap();
-        assert_eq!(collector.publication_count(), 1);
+        assert_eq!(collector.publications.len(), 1);
 
         collector.publish_done(2).unwrap();
-        assert_eq!(collector.publication_count(), 2);
+        assert_eq!(collector.publications.len(), 2);
+    }
+
+    #[test]
+    fn preserves_repeated_done_publications_in_order() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(1);
+        collector.set_head_name(1, "eDP-1".to_string()).unwrap();
+
+        collector.publish_done(5).unwrap();
+        collector
+            .set_head_description(1, "Internal display".to_string())
+            .unwrap();
+        collector.publish_done(6).unwrap();
+
+        let first = collector.take_publication().unwrap();
+        let second = collector.take_publication().unwrap();
+
+        assert_eq!(first.serial, 5);
+        assert_eq!(first.heads[0].description, None);
+        assert_eq!(second.serial, 6);
+        assert_eq!(
+            second.heads[0].description.as_deref(),
+            Some("Internal display")
+        );
+    }
+
+    #[test]
+    fn publication_helper_drains_snapshots_before_terminal_error() {
+        let mut state = ObserverState::default();
+        state.collector.note_head(1);
+        state
+            .collector
+            .set_head_name(1, "eDP-1".to_string())
+            .unwrap();
+        state.collector.publish_done(5).unwrap();
+        state.collector.publish_done(6).unwrap();
+        state.store_terminal(WaylandObserverError::ManagerFinished);
+
+        let (tx, rx) = mpsc::channel();
+        let status = publish_pending_results(&mut state, &tx);
+        let published = rx.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(status, PublishStatus::Stop);
+        assert_eq!(published.len(), 3);
+        assert_eq!(
+            published[0],
+            Ok(OutputSnapshot {
+                serial: 5,
+                heads: vec![first_head_snapshot("eDP-1")],
+            })
+        );
+        assert_eq!(
+            published[1],
+            Ok(OutputSnapshot {
+                serial: 6,
+                heads: vec![first_head_snapshot("eDP-1")],
+            })
+        );
+        assert_eq!(published[2], Err(WaylandObserverError::ManagerFinished));
+    }
+
+    #[test]
+    fn publication_helper_stops_when_receiver_is_dropped() {
+        let mut state = ObserverState::default();
+        state.collector.note_head(3);
+        state
+            .collector
+            .set_head_name(3, "HDMI-A-1".to_string())
+            .unwrap();
+        state.collector.publish_done(9).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+
+        assert_eq!(
+            publish_pending_results(&mut state, &tx),
+            PublishStatus::Stop
+        );
+    }
+
+    fn first_head_snapshot(name: &str) -> super::OutputHeadSnapshot {
+        super::OutputHeadSnapshot {
+            name: name.to_string(),
+            description: None,
+            enabled: false,
+            position: None,
+            transform: None,
+            scale: None,
+            current_mode: None,
+            modes: Vec::new(),
+        }
     }
 }
