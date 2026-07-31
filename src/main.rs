@@ -46,9 +46,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let watch_handle = tokio::spawn(async move {
-        DisplayManager::watch_changes(manager_ref, sway_connection_ref)
-            .await
-            .unwrap();
+        let result = DisplayManager::watch_changes(manager_ref, sway_connection_ref).await;
+        handle_watch_changes_result(result);
     });
 
     if let Err(e) = try_join!(watch_handle) {
@@ -56,6 +55,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     pending::<()>().await;
     Ok(())
+}
+
+fn handle_watch_changes_result(result: Result<(), Box<dyn Error>>) {
+    if let Err(error) = result {
+        error!("Display watcher stopped: {error}");
+    }
 }
 
 const SWAY_CONNECT_ATTEMPTS: usize = 3;
@@ -171,7 +176,12 @@ fn consume_wayland_observer(
 
 #[cfg(test)]
 mod tests {
-    use super::cosmic_desktop;
+    use super::{cosmic_desktop, handle_watch_changes_result};
+
+    #[test]
+    fn handles_watch_changes_error_without_panicking() {
+        handle_watch_changes_result(Err("watcher stopped".into()));
+    }
 
     #[test]
     fn identifies_cosmic_desktop_in_composite_value() {
