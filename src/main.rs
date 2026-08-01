@@ -33,9 +33,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let wayland_observer_handle = if let Some((handle, ready)) = wayland_observer {
-        ready
-            .await
-            .map_err(|_| "Wayland observer readiness channel closed")??;
+        if !wait_for_wayland_readiness(ready, WAYLAND_READINESS_TIMEOUT).await? {
+            warn!(
+                "Wayland observer readiness timed out after {:?}; registering D-Bus and continuing observation",
+                WAYLAND_READINESS_TIMEOUT
+            );
+        }
         Some(handle)
     } else {
         None
@@ -73,6 +76,7 @@ fn handle_watch_changes_result(result: Result<(), Box<dyn Error>>) {
 const SWAY_CONNECT_ATTEMPTS: usize = 3;
 const SWAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WAYLAND_RETRY_DELAY: Duration = Duration::from_millis(100);
+const WAYLAND_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
     value
@@ -224,6 +228,18 @@ fn notify_wayland_readiness(
     }
 }
 
+async fn wait_for_wayland_readiness(
+    ready: oneshot::Receiver<Result<(), String>>,
+    timeout: Duration,
+) -> Result<bool, Box<dyn Error>> {
+    match tokio::time::timeout(timeout, ready).await {
+        Ok(Ok(Ok(()))) => Ok(true),
+        Ok(Ok(Err(error))) => Err(error.into()),
+        Ok(Err(_)) => Err("Wayland observer readiness channel closed".into()),
+        Err(_) => Ok(false),
+    }
+}
+
 async fn publish_wayland_state_before_readiness(
     manager_ref: &Arc<Mutex<DisplayManager>>,
     candidate: DisplayManager,
@@ -372,6 +388,17 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_allows_startup_to_continue() {
+        let (_sender, receiver) = oneshot::channel();
+
+        assert!(
+            !wait_for_wayland_readiness(receiver, Duration::from_millis(1))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
