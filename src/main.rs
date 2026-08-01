@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         },
         WATCH_RESTART_DELAY,
+        WATCH_MAX_ATTEMPTS,
     ));
 
     return finish_sway_watcher(watch_handle.await);
@@ -92,21 +93,30 @@ fn watcher_should_restart(result: &Result<(), String>) -> bool {
 async fn supervise_sway_watcher<Watch, WatchFuture>(
     mut watch: Watch,
     restart_delay: Duration,
+    max_attempts: usize,
 ) -> Result<(), String>
 where
     Watch: FnMut() -> WatchFuture,
     WatchFuture: Future<Output = Result<(), String>>,
 {
-    loop {
+    for attempt in 1..=max_attempts {
         let result = watch().await;
-        let should_restart = watcher_should_restart(&result);
-        handle_watch_changes_result(result);
-        if !should_restart {
+        if result.is_ok() {
             return Ok(());
+        }
+        let error = result.expect_err("watcher result was checked for an error");
+        handle_watch_changes_result(Err(error.clone()));
+        if attempt == max_attempts {
+            return Err(format!(
+                "display watcher failed after {max_attempts} attempts: {}",
+                error
+            ));
         }
         warn!("Display watcher will restart after {:?}", restart_delay);
         tokio::time::sleep(restart_delay).await;
     }
+
+    Err("display watcher restart budget must be greater than zero".into())
 }
 
 fn handle_watch_changes_result(result: Result<(), String>) {
@@ -153,6 +163,7 @@ const WAYLAND_RETRY_DELAY: Duration = Duration::from_millis(100);
 const WAYLAND_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const WAYLAND_MAX_PENDING_ATTEMPTS: usize = 3;
 const WATCH_RESTART_DELAY: Duration = Duration::from_secs(1);
+const WATCH_MAX_ATTEMPTS: usize = 3;
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
     value
@@ -498,11 +509,30 @@ mod tests {
                 }
             },
             Duration::ZERO,
+            2,
         )
         .await;
 
         assert_eq!(result, Ok(()));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sway_supervisor_fails_after_bounded_restart_attempts() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let result = supervise_sway_watcher(
+            move || {
+                attempt_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err("broken pipe".to_string()) }
+            },
+            Duration::ZERO,
+            3,
+        )
+        .await;
+
+        assert_eq!(result, Err("display watcher failed after 3 attempts: broken pipe".into()));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -515,6 +545,7 @@ mod tests {
                 async { Ok(()) }
             },
             Duration::ZERO,
+            2,
         )
         .await;
 
