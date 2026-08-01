@@ -1,6 +1,7 @@
 use log::{error, info, warn};
 use regolith_displayd::wayland_observer::{
-    OutputSnapshot, WaylandObserverError, WaylandOutputObserver,
+    OutputHeadSnapshot, OutputModeSnapshot, OutputSnapshot, WaylandObserverError,
+    WaylandOutputObserver,
 };
 use regolith_displayd::{
     wayland_side_effect_stage, DisplayManager, DisplayServer, WaylandSideEffectStage,
@@ -224,6 +225,15 @@ fn notify_wayland_readiness(
     }
 }
 
+async fn publish_wayland_state_before_readiness(
+    manager_ref: &Arc<Mutex<DisplayManager>>,
+    candidate: DisplayManager,
+    ready_sender: &mut Option<oneshot::Sender<Result<(), String>>>,
+) {
+    *manager_ref.lock().await = candidate;
+    notify_wayland_readiness(ready_sender, Ok(()));
+}
+
 async fn publish_wayland_state_before_signal<Signal, SignalFuture>(
     manager_ref: &Arc<Mutex<DisplayManager>>,
     candidate: DisplayManager,
@@ -247,7 +257,11 @@ fn process_wayland_candidate(
     ready_sender: &mut Option<oneshot::Sender<Result<(), String>>>,
 ) {
     let candidate = runtime.block_on(async { candidate_manager.lock().await.clone() });
-    notify_wayland_readiness(ready_sender, Ok(()));
+    runtime.block_on(publish_wayland_state_before_readiness(
+        manager_ref,
+        candidate.clone(),
+        ready_sender,
+    ));
 
     let stage = wayland_side_effect_stage(
         state_changed,
@@ -368,6 +382,62 @@ mod tests {
         notify_wayland_readiness(&mut ready_sender, Ok(()));
         assert_eq!(receiver.await.unwrap(), Ok(()));
         assert!(ready_sender.is_none());
+    }
+    #[tokio::test]
+    async fn candidate_state_is_visible_when_readiness_is_released() {
+        let manager = Arc::new(Mutex::new(DisplayManager::new().await));
+        let candidate = Arc::new(Mutex::new(DisplayManager::new().await));
+        DisplayManager::install_wayland_snapshot(
+            Arc::clone(&candidate),
+            &OutputSnapshot {
+                serial: 42,
+                heads: vec![OutputHeadSnapshot {
+                    name: "HDMI-A-1".to_string(),
+                    description: None,
+                    enabled: true,
+                    position: Some((0, 0)),
+                    transform: Some(0),
+                    scale: Some(1.0),
+                    current_mode: Some(OutputModeSnapshot {
+                        width: 1920,
+                        height: 1080,
+                        refresh_mhz: Some(60_000),
+                        preferred: true,
+                        current: true,
+                    }),
+                    modes: Vec::new(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let expected = candidate.lock().await.clone();
+        let (sender, receiver) = oneshot::channel();
+        let mut ready_sender = Some(sender);
+
+        publish_wayland_state_before_readiness(&manager, expected.clone(), &mut ready_sender).await;
+
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+        assert!(manager.lock().await.has_observed_outputs());
+        assert_eq!(*manager.lock().await, expected);
+    }
+
+    #[tokio::test]
+    async fn side_effect_failure_does_not_delay_readiness_after_state_commit() {
+        let manager = Arc::new(Mutex::new(DisplayManager::new().await));
+        let candidate = DisplayManager::new().await;
+        let (sender, receiver) = oneshot::channel();
+        let mut ready_sender = Some(sender);
+
+        publish_wayland_state_before_readiness(&manager, candidate.clone(), &mut ready_sender)
+            .await;
+        let side_effect = publish_wayland_state_before_signal(&manager, candidate, || async {
+            Err("side effect failed".to_string())
+        })
+        .await;
+
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+        assert_eq!(side_effect, Err("side effect failed".to_string()));
     }
 
     #[tokio::test]
