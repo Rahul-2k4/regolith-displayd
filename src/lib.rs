@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::Command;
-use std::{error::Error, fs, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{error::Error, fs, path::PathBuf, sync::Arc, time::Duration};
 use swayipc_async::Connection;
 use tokio::sync::Mutex;
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
@@ -84,9 +84,12 @@ impl DisplayServer {
         let sway_connection = self.sway_connection.as_ref().ok_or_else(|| {
             zbus::fdo::Error::Failed(String::from("Sway IPC backend is unavailable"))
         })?;
-        let mut manager_obj = self.manager.lock().await;
-        debug!("Serial: {} {}", manager_obj.serial, serial);
-        if serial != manager_obj.serial {
+        let (current_serial, monitors) = {
+            let manager_obj = self.manager.lock().await;
+            (manager_obj.serial, manager_obj.monitors.clone())
+        };
+        debug!("Serial: {} {}", current_serial, serial);
+        if serial != current_serial {
             error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
             return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
         }
@@ -94,7 +97,7 @@ impl DisplayServer {
         for mutter_logical_mointor in &mutter_logical_monitors {
             // If apply_monitors_config called with method == 0 (Verify configuration)
             if method == 0 {
-                match mutter_logical_mointor.verify(sway_connection, &manager_obj.monitors) {
+                match mutter_logical_mointor.verify(sway_connection, &monitors) {
                     Ok(_) => {
                         continue;
                     }
@@ -108,11 +111,11 @@ impl DisplayServer {
             return Ok(());
         }
 
-        manager_obj.properties = properties;
-
-        let profile_name = profile_name_for_monitors(&manager_obj.monitors);
-        let profile_text = kanshi_profile_text(&manager_obj.monitors, &mutter_logical_monitors);
+        let profile_name = profile_name_for_monitors(&monitors);
+        let profile_text = kanshi_profile_text(&monitors, &mutter_logical_monitors);
         info!("Profile FileName: {profile_name}");
+
+        self.manager.lock().await.properties = properties;
 
         let profile_changed =
             match write_kanshi_profile_if_changed(&profile_name, &profile_text).await {
@@ -128,7 +131,7 @@ impl DisplayServer {
                 error!("Error reloading kanshi configuration: {e}");
             }
         }
-        if let Err(e) = manager_obj.get_monitor_info(sway_connection).await {
+        if let Err(e) = DisplayManager::get_monitor_info(sway_connection).await {
             error!("Error getting output information from sway: {e}");
         }
         DisplayManager::emit_monitors_changed().await?;
@@ -158,11 +161,7 @@ impl DisplayServer {
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
         if let Some(sway_connection) = &self.sway_connection {
-            self.manager
-                .lock()
-                .await
-                .get_monitor_info(sway_connection)
-                .await?;
+            DisplayManager::get_monitor_info(sway_connection).await?;
         }
 
         let mut connection = ZBUS_CONNECTION.lock().await;
@@ -193,10 +192,7 @@ impl DisplayManager {
         let Some(sway_connection) = sway_connection else {
             return Ok(());
         };
-        let display_info = {
-            let mut manager_obj_lock = manager_obj.lock().await;
-            manager_obj_lock.get_monitor_info(&sway_connection).await?
-        };
+        let display_info = DisplayManager::get_monitor_info(&sway_connection).await?;
         let mut prev_monitor_set: HashSet<Monitor> = display_info.0.iter().cloned().collect();
         let mut prev_logical_monitor_set: HashSet<LogicalMonitor> =
             display_info.1.iter().cloned().collect();
@@ -206,11 +202,8 @@ impl DisplayManager {
             manager_obj_lock.logical_monitors = display_info.1;
         }
         loop {
-            thread::sleep(Duration::from_millis(700));
-            let display_info = {
-                let mut manager_obj_lock = manager_obj.lock().await;
-                manager_obj_lock.get_monitor_info(&sway_connection).await?
-            };
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let display_info = DisplayManager::get_monitor_info(&sway_connection).await?;
             let mut monitor_set = HashSet::new();
             let mut logical_monitor_set = HashSet::new();
             for monitor in &display_info.0 {
@@ -246,9 +239,9 @@ impl DisplayManager {
     }
 
     pub async fn emit_monitors_changed() -> zbus::Result<()> {
-        let connection = ZBUS_CONNECTION.lock().await;
+        let connection = ZBUS_CONNECTION.lock().await.clone();
         info!("Emiting monitor changed");
-        if let Some(con) = &*connection {
+        if let Some(con) = connection.as_ref() {
             con.emit_signal(
                 Option::<&str>::None,
                 "/org/gnome/Mutter/DisplayConfig",
@@ -262,8 +255,7 @@ impl DisplayManager {
     }
 
     /// Returns list of all monitors and logical monitors
-    pub async fn get_monitor_info<'a>(
-        &mut self,
+    pub async fn get_monitor_info(
         sway_connection: &Arc<Mutex<Connection>>,
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
