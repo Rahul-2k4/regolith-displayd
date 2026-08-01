@@ -84,12 +84,11 @@ impl DisplayServer {
         let sway_connection = self.sway_connection.as_ref().ok_or_else(|| {
             zbus::fdo::Error::Failed(String::from("Sway IPC backend is unavailable"))
         })?;
-        let (current_serial, monitors) = {
-            let manager_obj = self.manager.lock().await;
-            (manager_obj.serial, manager_obj.monitors.clone())
-        };
-        debug!("Serial: {} {}", current_serial, serial);
-        if serial != current_serial {
+        // Serialize validation, persistence, and refresh so watch_changes cannot
+        // publish stale state while this request is being applied.
+        let mut manager_obj = self.manager.lock().await;
+        debug!("Serial: {} {}", manager_obj.serial, serial);
+        if serial != manager_obj.serial {
             error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
             return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
         }
@@ -97,7 +96,7 @@ impl DisplayServer {
         for mutter_logical_mointor in &mutter_logical_monitors {
             // If apply_monitors_config called with method == 0 (Verify configuration)
             if method == 0 {
-                match mutter_logical_mointor.verify(sway_connection, &monitors) {
+                match mutter_logical_mointor.verify(sway_connection, &manager_obj.monitors) {
                     Ok(_) => {
                         continue;
                     }
@@ -111,11 +110,11 @@ impl DisplayServer {
             return Ok(());
         }
 
-        let profile_name = profile_name_for_monitors(&monitors);
-        let profile_text = kanshi_profile_text(&monitors, &mutter_logical_monitors);
-        info!("Profile FileName: {profile_name}");
+        manager_obj.properties = properties;
 
-        self.manager.lock().await.properties = properties;
+        let profile_name = profile_name_for_monitors(&manager_obj.monitors);
+        let profile_text = kanshi_profile_text(&manager_obj.monitors, &mutter_logical_monitors);
+        info!("Profile FileName: {profile_name}");
 
         let profile_changed =
             match write_kanshi_profile_if_changed(&profile_name, &profile_text).await {
