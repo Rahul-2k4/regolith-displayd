@@ -8,6 +8,7 @@ use log::{debug, error, info, warn};
 use monitor::{KanshiProfileEntry, LogicalMonitor, Monitor, MonitorApply};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::Write;
 use std::process::Command;
 use std::{error::Error, fs, path::PathBuf, sync::Arc, time::Duration};
@@ -50,6 +51,55 @@ fn commit_refreshed_monitor_info(
     manager.properties = properties;
     manager.monitors = monitors;
     manager.logical_monitors = logical_monitors;
+    Ok(())
+}
+
+async fn apply_monitors_config_core<
+    WriteProfile,
+    WriteFuture,
+    Reload,
+    ReloadFuture,
+    Refresh,
+    RefreshFuture,
+    Signal,
+    SignalFuture,
+>(
+    manager: &mut DisplayManager,
+    properties: DisplayManagerProperties,
+    write_profile: WriteProfile,
+    reload: Reload,
+    refresh: Refresh,
+    signal: Signal,
+) -> zbus::fdo::Result<()>
+where
+    WriteProfile: FnOnce() -> WriteFuture,
+    WriteFuture: Future<Output = Result<bool, Box<dyn Error>>>,
+    Reload: FnOnce() -> ReloadFuture,
+    ReloadFuture: Future<Output = zbus::fdo::Result<()>>,
+    Refresh: FnOnce() -> RefreshFuture,
+    RefreshFuture: Future<Output = Result<(Vec<Monitor>, Vec<LogicalMonitor>), String>>,
+    Signal: FnOnce() -> SignalFuture,
+    SignalFuture: Future<Output = zbus::fdo::Result<()>>,
+{
+    let profile_changed = write_profile()
+        .await
+        .map_err(|error| zbus::fdo::Error::IOError(error.to_string()))?;
+
+    if profile_changed {
+        reload().await?;
+    }
+
+    let refreshed = refresh().await.map_err(|error| {
+        zbus::fdo::Error::Failed(format!(
+            "Unable to refresh output information from sway: {error}"
+        ))
+    })?;
+    commit_refreshed_monitor_info(manager, properties, Ok(refreshed)).map_err(|error| {
+        zbus::fdo::Error::Failed(format!(
+            "Unable to refresh output information from sway: {error}"
+        ))
+    })?;
+    signal().await?;
     Ok(())
 }
 
@@ -125,38 +175,29 @@ impl DisplayServer {
         let profile_text = kanshi_profile_text(&manager_obj.monitors, &mutter_logical_monitors);
         info!("Profile FileName: {profile_name}");
 
-        let profile_changed =
-            match write_kanshi_profile_if_changed(&profile_name, &profile_text).await {
-                Ok(changed) => changed,
-                Err(e) => {
-                    error!("Error writing data to kanshi config file: {e}");
-                    return Err(zbus::fdo::Error::IOError(e.to_string()));
-                }
-            };
-
-        if profile_changed {
-            if let Err(e) = reload_kanshi().await {
-                error!("Error reloading kanshi configuration: {e}");
-            }
-        }
-        let refreshed_monitor_info = DisplayManager::get_monitor_info(sway_connection)
-            .await
-            .map_err(|e| e.to_string());
-        // Kanshi may already have changed the compositor. Report failure when
-        // Sway cannot confirm the result, while keeping the D-Bus manager state
-        // unchanged instead of exposing a partially committed configuration.
-        if let Err(e) =
-            commit_refreshed_monitor_info(&mut manager_obj, properties, refreshed_monitor_info)
-        {
-            error!(
-                "Unable to refresh output information from sway after applying configuration: {e}"
-            );
-            return Err(zbus::fdo::Error::Failed(format!(
-                "Unable to refresh output information from sway: {e}"
-            )));
-        }
-        DisplayManager::emit_monitors_changed().await?;
-        Ok(())
+        apply_monitors_config_core(
+            &mut manager_obj,
+            properties,
+            || write_kanshi_profile_if_changed(&profile_name, &profile_text),
+            || async {
+                reload_kanshi().await.map_err(|error| {
+                    zbus::fdo::Error::Failed(format!(
+                        "Unable to reload kanshi configuration: {error}"
+                    ))
+                })
+            },
+            || async {
+                DisplayManager::get_monitor_info(sway_connection)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            || async {
+                DisplayManager::emit_monitors_changed()
+                    .await
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+            },
+        )
+        .await
     }
 
     #[dbus_interface(property)]
@@ -219,8 +260,7 @@ impl DisplayManager {
             display_info.1.iter().cloned().collect();
         {
             let mut manager_obj_lock = manager_obj.lock().await;
-            manager_obj_lock.monitors = display_info.0;
-            manager_obj_lock.logical_monitors = display_info.1;
+            manager_obj_lock.replace_observed_state(display_info.0, display_info.1);
         }
         loop {
             tokio::time::sleep(Duration::from_millis(700)).await;
@@ -242,8 +282,7 @@ impl DisplayManager {
                 let profile = observed_profile(&display_info.0, &display_info.1);
                 {
                     let mut manager_obj_lock = manager_obj.lock().await;
-                    manager_obj_lock.monitors = display_info.0;
-                    manager_obj_lock.logical_monitors = display_info.1;
+                    manager_obj_lock.replace_observed_state(display_info.0, display_info.1);
                     debug!("monitors info: {:#?}", manager_obj_lock.monitors);
                     debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
                 }
@@ -324,6 +363,17 @@ impl DisplayManager {
         false
     }
 
+    /// Replace only compositor-observed output state. `properties` is invariant
+    /// protocol metadata and is never inferred from Sway or Wayland outputs.
+    fn replace_observed_state(
+        &mut self,
+        monitors: Vec<Monitor>,
+        logical_monitors: Vec<LogicalMonitor>,
+    ) {
+        self.monitors = monitors;
+        self.logical_monitors = logical_monitors;
+    }
+
     pub fn replace_from_wayland_snapshot(
         &mut self,
         snapshot: &OutputSnapshot,
@@ -358,8 +408,7 @@ impl DisplayManager {
 
         let changed = self.monitors != monitors || self.logical_monitors != logical_monitors;
         self.serial = snapshot.serial;
-        self.monitors = monitors;
-        self.logical_monitors = logical_monitors;
+        self.replace_observed_state(monitors, logical_monitors);
         Ok(changed)
     }
 }
@@ -645,6 +694,198 @@ mod tests {
 
         assert_eq!(result, Err("refresh failed".to_string()));
         assert_eq!(manager, previous);
+    }
+
+    #[tokio::test]
+    async fn apply_core_runs_reload_refresh_commit_and_signal_in_order() {
+        let previous_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let refreshed_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let refreshed_logical =
+            LogicalMonitor::test_new("eDP-1", "1920x1080@60Hz", 0, 0, 1.0, 0, true);
+        let mut manager = build_manager(vec![previous_monitor], Vec::new());
+        let properties = DisplayManagerProperties {
+            layout: Some(7),
+            ..DisplayManagerProperties::new()
+        };
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let write_events = Arc::clone(&events);
+        let reload_events = Arc::clone(&events);
+        let refresh_events = Arc::clone(&events);
+        let signal_events = Arc::clone(&events);
+        apply_monitors_config_core(
+            &mut manager,
+            properties.clone(),
+            move || {
+                write_events.lock().unwrap().push("write");
+                async { Ok(true) }
+            },
+            move || {
+                reload_events.lock().unwrap().push("reload");
+                async { Ok(()) }
+            },
+            move || {
+                refresh_events.lock().unwrap().push("refresh");
+                async { Ok((vec![refreshed_monitor], vec![refreshed_logical])) }
+            },
+            move || {
+                signal_events.lock().unwrap().push("signal");
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["write", "reload", "refresh", "signal"]
+        );
+        assert_eq!(manager.properties, properties);
+        assert_eq!(manager.monitors[0].get_current_mode(), "1920x1080@60Hz");
+        assert_eq!(manager.logical_monitors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_core_refresh_failure_keeps_manager_unchanged_and_skips_signal() {
+        let previous_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let mut manager = build_manager(vec![previous_monitor], Vec::new());
+        let previous = manager.clone();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let write_events = Arc::clone(&events);
+        let reload_events = Arc::clone(&events);
+        let refresh_events = Arc::clone(&events);
+        let signal_events = Arc::clone(&events);
+
+        let result = apply_monitors_config_core(
+            &mut manager,
+            DisplayManagerProperties::new(),
+            move || {
+                write_events.lock().unwrap().push("write");
+                async { Ok(true) }
+            },
+            move || {
+                reload_events.lock().unwrap().push("reload");
+                async { Ok(()) }
+            },
+            move || {
+                refresh_events.lock().unwrap().push("refresh");
+                async { Err("refresh failed".to_string()) }
+            },
+            move || {
+                signal_events.lock().unwrap().push("signal");
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(zbus::fdo::Error::Failed(message)) if message.contains("refresh failed")
+        ));
+        assert_eq!(manager, previous);
+        assert_eq!(*events.lock().unwrap(), vec!["write", "reload", "refresh"]);
+    }
+
+    #[tokio::test]
+    async fn apply_core_reload_failure_keeps_manager_unchanged_and_skips_refresh_and_signal() {
+        let previous_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let mut manager = build_manager(vec![previous_monitor], Vec::new());
+        let previous = manager.clone();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let write_events = Arc::clone(&events);
+        let reload_events = Arc::clone(&events);
+        let refresh_events = Arc::clone(&events);
+        let signal_events = Arc::clone(&events);
+
+        let result = apply_monitors_config_core(
+            &mut manager,
+            DisplayManagerProperties::new(),
+            move || {
+                write_events.lock().unwrap().push("write");
+                async { Ok(true) }
+            },
+            move || {
+                reload_events.lock().unwrap().push("reload");
+                async { Err(zbus::fdo::Error::Failed("reload failed".to_string())) }
+            },
+            move || {
+                refresh_events.lock().unwrap().push("refresh");
+                async { Ok((Vec::new(), Vec::new())) }
+            },
+            move || {
+                signal_events.lock().unwrap().push("signal");
+                async { Ok(()) }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(zbus::fdo::Error::Failed(message)) if message == "reload failed"
+        ));
+        assert_eq!(manager, previous);
+        assert_eq!(*events.lock().unwrap(), vec!["write", "reload"]);
+    }
+
+    #[test]
+    fn observed_state_reconciliation_preserves_invariant_properties() {
+        let mut manager = build_manager(Vec::new(), Vec::new());
+        manager.properties = DisplayManagerProperties {
+            layout: Some(7),
+            support_layout_change: Some(false),
+            global_scale: Some(true),
+            legacy_scale_factor: Some(2),
+        };
+        let properties = manager.properties.clone();
+
+        manager.replace_observed_state(
+            vec![Monitor::test_new(
+                "HDMI-A-1",
+                "Projector",
+                "Room",
+                "B2",
+                vec![Modes::test_new("1920x1080@60Hz")],
+            )],
+            vec![LogicalMonitor::from_snapshot(&snapshot_head(
+                "HDMI-A-1",
+                true,
+                Some((100, 200)),
+                Some(0),
+                Some(1.5),
+                1920,
+                1080,
+                Some(60_000),
+            ))
+            .unwrap()],
+        );
+
+        assert_eq!(manager.properties, properties);
+        assert_eq!(manager.monitors[0].get_dpy_name(), "Projector Room B2");
+        assert_eq!(manager.logical_monitors[0].get_dpy_name(), "HDMI-A-1");
     }
 
     fn snapshot_head(
