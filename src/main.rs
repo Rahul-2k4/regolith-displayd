@@ -1,7 +1,6 @@
 use log::{error, info, warn};
 use regolith_displayd::wayland_observer::{
-    OutputHeadSnapshot, OutputModeSnapshot, OutputSnapshot, WaylandObserverError,
-    WaylandOutputObserver,
+    OutputSnapshot, WaylandObserverError, WaylandOutputObserver,
 };
 use regolith_displayd::{
     wayland_side_effect_stage, DisplayManager, DisplayServer, WaylandSideEffectStage,
@@ -342,6 +341,7 @@ fn process_wayland_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regolith_displayd::wayland_observer::{OutputHeadSnapshot, OutputModeSnapshot};
 
     #[test]
     fn handles_watch_changes_error_without_panicking() {

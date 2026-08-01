@@ -331,6 +331,9 @@ impl DisplayManager {
                 &logical_monitor_set,
             ) {
                 let profile = observed_profile(&display_info.0, &display_info.1);
+                let observed_monitors = display_info.0.clone();
+                let observed_logical_monitors = display_info.1.clone();
+                let manager_for_commit = Arc::clone(&manager_obj);
                 let side_effects = retry_watch_side_effects(
                     profile
                         .as_ref()
@@ -350,6 +353,21 @@ impl DisplayManager {
                         .map_err(|error| error.to_string())
                     },
                     || async { reload_kanshi().await.map_err(|error| error.to_string()) },
+                    || {
+                        let manager_for_commit = Arc::clone(&manager_for_commit);
+                        let observed_monitors = observed_monitors.clone();
+                        let observed_logical_monitors = observed_logical_monitors.clone();
+                        async move {
+                            let mut manager_obj_lock = manager_for_commit.lock().await;
+                            manager_obj_lock.replace_observed_state(
+                                observed_monitors,
+                                observed_logical_monitors,
+                            );
+                            debug!("monitors info: {:#?}", manager_obj_lock.monitors);
+                            debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
+                            Ok(())
+                        }
+                    },
                     || async {
                         Self::emit_monitors_changed()
                             .await
@@ -359,12 +377,6 @@ impl DisplayManager {
                 .await;
                 if side_effects.is_err() {
                     continue;
-                }
-                {
-                    let mut manager_obj_lock = manager_obj.lock().await;
-                    manager_obj_lock.replace_observed_state(display_info.0, display_info.1);
-                    debug!("monitors info: {:#?}", manager_obj_lock.monitors);
-                    debug!("logical monitors: {:#?}", manager_obj_lock.logical_monitors);
                 }
                 prev_monitor_set = monitor_set;
                 prev_logical_monitor_set = logical_monitor_set;
@@ -610,10 +622,20 @@ fn get_disabled_monitors<'a>(
         .collect()
 }
 
-async fn retry_watch_side_effects<Write, WriteFuture, Reload, ReloadFuture, Signal, SignalFuture>(
+async fn retry_watch_side_effects<
+    Write,
+    WriteFuture,
+    Reload,
+    ReloadFuture,
+    Commit,
+    CommitFuture,
+    Signal,
+    SignalFuture,
+>(
     profile: Option<(&str, &str)>,
     mut write_profile: Write,
     mut reload: Reload,
+    mut commit: Commit,
     mut signal: Signal,
 ) -> Result<(), String>
 where
@@ -621,11 +643,14 @@ where
     WriteFuture: Future<Output = Result<bool, String>>,
     Reload: FnMut() -> ReloadFuture,
     ReloadFuture: Future<Output = Result<(), String>>,
+    Commit: FnMut() -> CommitFuture,
+    CommitFuture: Future<Output = Result<(), String>>,
     Signal: FnMut() -> SignalFuture,
     SignalFuture: Future<Output = Result<(), String>>,
 {
     let mut profile_ready = profile.is_none();
     let mut reload_ready = profile.is_none();
+    let mut state_committed = false;
 
     loop {
         if !profile_ready {
@@ -647,6 +672,14 @@ where
                 continue;
             }
             reload_ready = true;
+        }
+        if !state_committed {
+            if let Err(error) = commit().await {
+                warn!("Unable to commit observed monitor state: {error}");
+                tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                continue;
+            }
+            state_committed = true;
         }
         if let Err(error) = signal().await {
             warn!("Unable to emit MonitorsChanged after observed state update: {error}");
@@ -1189,6 +1222,7 @@ mod tests {
                     }
                 }
             },
+            || async { Ok(()) },
             move || {
                 let attempt = signal_count.fetch_add(1, Ordering::SeqCst);
                 signal_events.lock().unwrap().push("signal");
@@ -1227,6 +1261,7 @@ mod tests {
                 reload_count.fetch_add(1, Ordering::SeqCst);
                 async { Ok(()) }
             },
+            || async { Ok(()) },
             move || {
                 let attempt = signal_count.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -1243,6 +1278,101 @@ mod tests {
 
         assert_eq!(reloads.load(Ordering::SeqCst), 1);
         assert_eq!(signals.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn commits_observed_state_before_signal_and_retries_signal_without_replaying_persistence()
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let previous_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let observed_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let observed_logical =
+            LogicalMonitor::test_new("eDP-1", "1920x1080@60Hz", 0, 0, 1.0, 0, true);
+        let manager = Arc::new(Mutex::new(build_manager(
+            vec![previous_monitor],
+            Vec::new(),
+        )));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let signals = Arc::new(AtomicUsize::new(0));
+
+        let write_events = Arc::clone(&events);
+        let write_count = Arc::clone(&writes);
+        let reload_events = Arc::clone(&events);
+        let reload_count = Arc::clone(&reloads);
+        let commit_events = Arc::clone(&events);
+        let commit_manager = Arc::clone(&manager);
+        let signal_events = Arc::clone(&events);
+        let signal_manager = Arc::clone(&manager);
+        let signal_count = Arc::clone(&signals);
+        let expected_monitor = observed_monitor.clone();
+        let expected_logical = observed_logical.clone();
+
+        retry_watch_side_effects(
+            Some(("profile", "text")),
+            move || {
+                write_count.fetch_add(1, Ordering::SeqCst);
+                write_events.lock().unwrap().push("write");
+                async { Ok(true) }
+            },
+            move || {
+                reload_count.fetch_add(1, Ordering::SeqCst);
+                reload_events.lock().unwrap().push("reload");
+                async { Ok(()) }
+            },
+            move || {
+                let commit_manager = Arc::clone(&commit_manager);
+                let expected_monitor = expected_monitor.clone();
+                let expected_logical = expected_logical.clone();
+                commit_events.lock().unwrap().push("commit");
+                async move {
+                    let mut manager = commit_manager.lock().await;
+                    manager.replace_observed_state(vec![expected_monitor], vec![expected_logical]);
+                    Ok(())
+                }
+            },
+            move || {
+                let signal_manager = Arc::clone(&signal_manager);
+                let expected_monitor = observed_monitor.clone();
+                let expected_logical = observed_logical.clone();
+                let attempt = signal_count.fetch_add(1, Ordering::SeqCst);
+                signal_events.lock().unwrap().push("signal");
+                async move {
+                    let manager = signal_manager.lock().await;
+                    assert_eq!(manager.monitors, vec![expected_monitor]);
+                    assert_eq!(manager.logical_monitors, vec![expected_logical]);
+                    if attempt == 0 {
+                        Err("signal failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(signals.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["write", "reload", "commit", "signal", "signal"]
+        );
     }
 
     #[test]
