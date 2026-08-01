@@ -36,8 +36,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             Ok(true) => {}
             Err(error) => {
-                let _ = handle.await;
-                return Err(error);
+                let observer_result = handle.await;
+                return Err(finish_wayland_startup_failure(error, observer_result));
             }
         }
         Some(handle)
@@ -122,6 +122,17 @@ fn finish_wayland_observer(result: Result<(), String>) -> Result<(), Box<dyn Err
             Ok(())
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn finish_wayland_startup_failure(
+    readiness_error: Box<dyn Error>,
+    observer_result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Box<dyn Error> {
+    match observer_result {
+        Ok(Err(error)) => error.into(),
+        Err(error) => format!("Wayland observer task failed: {error}").into(),
+        Ok(Ok(())) => readiness_error,
     }
 }
 
@@ -509,6 +520,40 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn early_wayland_observer_failure_is_preserved_over_readiness_error() {
+        let readiness_error =
+            std::io::Error::new(std::io::ErrorKind::Other, "readiness channel closed");
+        let error = finish_wayland_startup_failure(
+            Box::new(readiness_error),
+            Ok(Err("observer failed before readiness".to_string())),
+        );
+
+        assert_eq!(error.to_string(), "observer failed before readiness");
+    }
+
+    #[test]
+    fn readiness_error_is_used_when_observer_completed_cleanly() {
+        let readiness_error =
+            std::io::Error::new(std::io::ErrorKind::Other, "readiness channel closed");
+        let error = finish_wayland_startup_failure(Box::new(readiness_error), Ok(Ok(())));
+
+        assert_eq!(error.to_string(), "readiness channel closed");
+    }
+
+    #[tokio::test]
+    async fn wayland_observer_join_error_is_preserved() {
+        let handle = tokio::spawn(async {
+            panic!("observer panic");
+        });
+        let join_error = handle.await.unwrap_err();
+        let readiness_error =
+            std::io::Error::new(std::io::ErrorKind::Other, "readiness channel closed");
+        let error = finish_wayland_startup_failure(Box::new(readiness_error), Err(join_error));
+
+        assert!(error.to_string().contains("Wayland observer task failed"));
     }
 
     #[test]
