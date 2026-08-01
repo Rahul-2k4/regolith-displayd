@@ -25,6 +25,13 @@ lazy_static! {
 
 const WATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaylandSideEffectStage {
+    PersistProfile,
+    ReloadKanshi,
+    Signal,
+}
+
 /// Stores configrations, interacts with sway IPC and monitors hardware changes
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 pub struct DisplayManager {
@@ -40,6 +47,34 @@ pub fn wayland_side_effects_required(state_changed: bool, pending_side_effects: 
 
 pub fn wayland_reload_required(profile_changed: bool, pending_side_effects: bool) -> bool {
     profile_changed || pending_side_effects
+}
+
+pub fn wayland_side_effect_stage(
+    state_changed: bool,
+    pending_stage: Option<WaylandSideEffectStage>,
+    profile_present: bool,
+) -> Option<WaylandSideEffectStage> {
+    if state_changed {
+        Some(if profile_present {
+            WaylandSideEffectStage::PersistProfile
+        } else {
+            WaylandSideEffectStage::Signal
+        })
+    } else {
+        pending_stage
+    }
+}
+
+pub fn wayland_stage_after_profile(profile_changed: bool) -> WaylandSideEffectStage {
+    if profile_changed {
+        WaylandSideEffectStage::ReloadKanshi
+    } else {
+        WaylandSideEffectStage::Signal
+    }
+}
+
+pub fn wayland_stage_after_reload() -> WaylandSideEffectStage {
+    WaylandSideEffectStage::Signal
 }
 
 /// DBus Interface for providing bindings
@@ -244,6 +279,10 @@ impl DisplayServer {
     }
 }
 impl DisplayManager {
+    pub fn has_observed_outputs(&self) -> bool {
+        !self.monitors.is_empty()
+    }
+
     pub async fn new() -> DisplayManager {
         DisplayManager {
             serial: 0,
@@ -371,35 +410,29 @@ impl DisplayManager {
         manager.replace_from_wayland_snapshot(snapshot)
     }
 
-    pub async fn persist_wayland_state(
+    pub async fn advance_wayland_side_effect(
         manager_obj: Arc<Mutex<DisplayManager>>,
-        pending_side_effects: bool,
-    ) -> bool {
+        stage: WaylandSideEffectStage,
+    ) -> Result<WaylandSideEffectStage, String> {
+        if stage == WaylandSideEffectStage::ReloadKanshi {
+            reload_kanshi().await.map_err(|error| error.to_string())?;
+            return Ok(wayland_stage_after_reload());
+        }
+        if stage == WaylandSideEffectStage::Signal {
+            return Ok(WaylandSideEffectStage::Signal);
+        }
+
         let profile = {
             let manager = manager_obj.lock().await;
             observed_profile(&manager.monitors, &manager.logical_monitors)
         };
-        if let Some((name, text)) = profile {
-            match write_kanshi_profile_if_changed(&name, &text).await {
-                Ok(profile_changed) => {
-                    if wayland_reload_required(profile_changed, pending_side_effects) {
-                        if let Err(error) = reload_kanshi().await {
-                            error!("Error reloading kanshi configuration: {}", error);
-                            return true;
-                        }
-                    }
-                }
-                Err(error) => {
-                    error!("Error writing data to kanshi config file: {}", error);
-                    return true;
-                }
-            }
-        }
-        if let Err(error) = Self::emit_monitors_changed().await {
-            error!("Error emitting MonitorsChanged: {}", error);
-            return true;
-        }
-        false
+        let Some((name, text)) = profile else {
+            return Ok(WaylandSideEffectStage::Signal);
+        };
+        let profile_changed = write_kanshi_profile_if_changed(&name, &text)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(wayland_stage_after_profile(profile_changed))
     }
 
     /// Replace only compositor-observed output state. `properties` is invariant
@@ -1081,6 +1114,44 @@ mod tests {
         assert!(wayland_side_effects_required(false, true));
         assert!(wayland_reload_required(false, true));
     }
+
+    #[test]
+    fn unchanged_pending_wayland_retry_keeps_its_stage() {
+        assert_eq!(
+            wayland_side_effect_stage(false, Some(WaylandSideEffectStage::Signal), true),
+            Some(WaylandSideEffectStage::Signal)
+        );
+        assert_eq!(
+            wayland_side_effect_stage(false, Some(WaylandSideEffectStage::ReloadKanshi), true),
+            Some(WaylandSideEffectStage::ReloadKanshi)
+        );
+    }
+
+    #[test]
+    fn changed_wayland_snapshot_starts_profile_side_effects() {
+        assert_eq!(
+            wayland_side_effect_stage(true, None, true),
+            Some(WaylandSideEffectStage::PersistProfile)
+        );
+        assert_eq!(
+            wayland_side_effect_stage(true, None, false),
+            Some(WaylandSideEffectStage::Signal)
+        );
+    }
+
+    #[test]
+    fn profile_and_reload_success_advance_to_signal_without_replaying_reload() {
+        assert_eq!(
+            wayland_stage_after_profile(true),
+            WaylandSideEffectStage::ReloadKanshi
+        );
+        assert_eq!(
+            wayland_stage_after_profile(false),
+            WaylandSideEffectStage::Signal
+        );
+        assert_eq!(wayland_stage_after_reload(), WaylandSideEffectStage::Signal);
+    }
+
     #[tokio::test]
     async fn retries_transient_watch_side_effect_failures_before_publishing_state() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1139,6 +1210,39 @@ mod tests {
             *events.lock().unwrap(),
             vec!["write", "write", "reload", "reload", "signal", "signal"]
         );
+    }
+
+    #[tokio::test]
+    async fn signal_only_retry_does_not_replay_successful_reload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let signals = Arc::new(AtomicUsize::new(0));
+        let reload_count = Arc::clone(&reloads);
+        let signal_count = Arc::clone(&signals);
+
+        retry_watch_side_effects(
+            Some(("profile", "text")),
+            || async { Ok(true) },
+            move || {
+                reload_count.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+            move || {
+                let attempt = signal_count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err("signal failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+        assert_eq!(signals.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -2,8 +2,15 @@ use log::{error, info, warn};
 use regolith_displayd::wayland_observer::{
     OutputSnapshot, WaylandObserverError, WaylandOutputObserver,
 };
-use regolith_displayd::{wayland_side_effects_required, DisplayManager, DisplayServer};
-use std::{error::Error, future::pending, sync::Arc, time::Duration};
+use regolith_displayd::{
+    wayland_side_effect_stage, DisplayManager, DisplayServer, WaylandSideEffectStage,
+};
+use std::{
+    error::Error,
+    future::{pending, Future},
+    sync::{mpsc::RecvTimeoutError, Arc},
+    time::Duration,
+};
 use swayipc_async::Connection as SwayConection;
 use tokio::{
     sync::{oneshot, Mutex},
@@ -65,6 +72,7 @@ fn handle_watch_changes_result(result: Result<(), Box<dyn Error>>) {
 
 const SWAY_CONNECT_ATTEMPTS: usize = 3;
 const SWAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
+const WAYLAND_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
     value
@@ -133,10 +141,34 @@ fn consume_wayland_observer(
 ) {
     let runtime = tokio::runtime::Handle::current();
 
-    let mut pending_side_effects = false;
     let mut pending_manager = None;
+    let mut pending_stage = None;
     // COSMIC snapshots use the same persistence and signal path as Sway observations.
-    while let Ok(result) = receiver.recv() {
+    loop {
+        let result = match pending_stage {
+            Some(_) => match receiver.recv_timeout(WAYLAND_RETRY_DELAY) {
+                Ok(result) => result,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(manager) = pending_manager.clone() {
+                        process_wayland_candidate(
+                            &runtime,
+                            &manager_ref,
+                            Arc::new(Mutex::new(manager)),
+                            false,
+                            &mut pending_stage,
+                            &mut pending_manager,
+                            &mut ready_sender,
+                        );
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match receiver.recv() {
+                Ok(result) => result,
+                Err(_) => break,
+            },
+        };
         match result {
             Ok(snapshot) => {
                 let base_manager = pending_manager.clone().unwrap_or_else(|| {
@@ -149,30 +181,15 @@ fn consume_wayland_observer(
                 ));
                 match install {
                     Ok(state_changed) => {
-                        if wayland_side_effects_required(state_changed, pending_side_effects) {
-                            pending_side_effects =
-                                runtime.block_on(DisplayManager::persist_wayland_state(
-                                    Arc::clone(&candidate_manager),
-                                    pending_side_effects,
-                                ));
-                        }
-                        if pending_side_effects {
-                            pending_manager = Some(
-                                runtime.block_on(async { candidate_manager.lock().await.clone() }),
-                            );
-                        } else {
-                            pending_manager = None;
-                            if state_changed {
-                                let candidate = runtime
-                                    .block_on(async { candidate_manager.lock().await.clone() });
-                                runtime.block_on(async {
-                                    *manager_ref.lock().await = candidate;
-                                });
-                            }
-                            if let Some(sender) = ready_sender.take() {
-                                let _ = sender.send(Ok(()));
-                            }
-                        }
+                        process_wayland_candidate(
+                            &runtime,
+                            &manager_ref,
+                            candidate_manager,
+                            state_changed,
+                            &mut pending_stage,
+                            &mut pending_manager,
+                            &mut ready_sender,
+                        );
                     }
                     Err(error) => {
                         warn!(
@@ -192,12 +209,125 @@ fn consume_wayland_observer(
         }
     }
 
+    if let Some(sender) = ready_sender.take() {
+        let _ = sender.send(Err("Wayland observer receiver closed".to_string()));
+    }
     info!("Wayland output observation receiver closed; state-only loop exiting");
+}
+
+fn notify_wayland_readiness(
+    ready_sender: &mut Option<oneshot::Sender<Result<(), String>>>,
+    result: Result<(), String>,
+) {
+    if let Some(sender) = ready_sender.take() {
+        let _ = sender.send(result);
+    }
+}
+
+async fn publish_wayland_state_before_signal<Signal, SignalFuture>(
+    manager_ref: &Arc<Mutex<DisplayManager>>,
+    candidate: DisplayManager,
+    signal: Signal,
+) -> Result<(), String>
+where
+    Signal: FnOnce() -> SignalFuture,
+    SignalFuture: Future<Output = Result<(), String>>,
+{
+    *manager_ref.lock().await = candidate;
+    signal().await
+}
+
+fn process_wayland_candidate(
+    runtime: &tokio::runtime::Handle,
+    manager_ref: &Arc<Mutex<DisplayManager>>,
+    candidate_manager: Arc<Mutex<DisplayManager>>,
+    state_changed: bool,
+    pending_stage: &mut Option<WaylandSideEffectStage>,
+    pending_manager: &mut Option<DisplayManager>,
+    ready_sender: &mut Option<oneshot::Sender<Result<(), String>>>,
+) {
+    let candidate = runtime.block_on(async { candidate_manager.lock().await.clone() });
+    notify_wayland_readiness(ready_sender, Ok(()));
+
+    let stage = wayland_side_effect_stage(
+        state_changed,
+        *pending_stage,
+        candidate.has_observed_outputs(),
+    );
+    let Some(stage) = stage else {
+        *pending_stage = None;
+        *pending_manager = None;
+        runtime.block_on(async {
+            *manager_ref.lock().await = candidate;
+        });
+        return;
+    };
+
+    if stage == WaylandSideEffectStage::Signal {
+        let result = runtime.block_on(publish_wayland_state_before_signal(
+            manager_ref,
+            candidate.clone(),
+            || async {
+                DisplayManager::emit_monitors_changed()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        ));
+        match result {
+            Ok(()) => {
+                *pending_stage = None;
+                *pending_manager = None;
+            }
+            Err(error) => {
+                error!("Error emitting MonitorsChanged: {error}");
+                *pending_stage = Some(WaylandSideEffectStage::Signal);
+                *pending_manager = Some(candidate);
+            }
+        }
+        return;
+    }
+
+    match runtime.block_on(DisplayManager::advance_wayland_side_effect(
+        Arc::clone(&candidate_manager),
+        stage,
+    )) {
+        Ok(next_stage) if next_stage == WaylandSideEffectStage::Signal => {
+            let result = runtime.block_on(publish_wayland_state_before_signal(
+                manager_ref,
+                candidate.clone(),
+                || async {
+                    DisplayManager::emit_monitors_changed()
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+            ));
+            match result {
+                Ok(()) => {
+                    *pending_stage = None;
+                    *pending_manager = None;
+                }
+                Err(error) => {
+                    error!("Error emitting MonitorsChanged: {error}");
+                    *pending_stage = Some(WaylandSideEffectStage::Signal);
+                    *pending_manager = Some(candidate);
+                }
+            }
+        }
+        Ok(next_stage) => {
+            *pending_stage = Some(next_stage);
+            *pending_manager = Some(candidate);
+        }
+        Err(error) => {
+            warn!("Unable to advance Wayland display side effects at {stage:?}: {error}");
+            *pending_stage = Some(stage);
+            *pending_manager = Some(candidate);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cosmic_desktop, handle_watch_changes_result};
+    use super::*;
 
     #[test]
     fn handles_watch_changes_error_without_panicking() {
@@ -213,5 +343,39 @@ mod tests {
     fn does_not_treat_other_desktops_as_cosmic() {
         assert!(!cosmic_desktop(Some("GNOME")));
         assert!(!cosmic_desktop(None));
+    }
+
+    #[tokio::test]
+    async fn publishes_manager_state_before_emitting_signal() {
+        let manager = Arc::new(Mutex::new(DisplayManager::new().await));
+        let candidate = DisplayManager::new().await;
+        let expected = candidate.clone();
+        let observed = Arc::clone(&manager);
+
+        publish_wayland_state_before_signal(&manager, candidate, move || async move {
+            assert_eq!(*observed.lock().await, expected);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_is_available_before_side_effect_failure() {
+        let (sender, receiver) = oneshot::channel();
+        let mut ready_sender = Some(sender);
+
+        notify_wayland_readiness(&mut ready_sender, Ok(()));
+        assert_eq!(receiver.await.unwrap(), Ok(()));
+        assert!(ready_sender.is_none());
+    }
+
+    #[tokio::test]
+    async fn observer_failure_releases_startup_readiness_waiter() {
+        let (sender, receiver) = oneshot::channel();
+        let mut ready_sender = Some(sender);
+
+        notify_wayland_readiness(&mut ready_sender, Err("observer stopped".to_string()));
+        assert_eq!(receiver.await.unwrap(), Err("observer stopped".to_string()));
     }
 }
