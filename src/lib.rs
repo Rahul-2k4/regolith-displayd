@@ -667,7 +667,7 @@ where
                         continue;
                     }
                     return Err(format!(
-                        "watch side effect failed after {WATCH_RETRY_ATTEMPTS} attempts"
+                        "watch side effect failed after {WATCH_MAX_SIDE_EFFECT_ATTEMPTS} attempts"
                     ));
                 }
             };
@@ -682,7 +682,7 @@ where
                     continue;
                 }
                 return Err(format!(
-                    "watch side effect failed after {WATCH_RETRY_ATTEMPTS} attempts"
+                    "watch side effect failed after {WATCH_MAX_SIDE_EFFECT_ATTEMPTS} attempts"
                 ));
             }
             reload_ready = true;
@@ -695,7 +695,7 @@ where
                     continue;
                 }
                 return Err(format!(
-                    "watch side effect failed after {WATCH_RETRY_ATTEMPTS} attempts"
+                    "watch side effect failed after {WATCH_MAX_SIDE_EFFECT_ATTEMPTS} attempts"
                 ));
             }
             state_committed = true;

@@ -63,7 +63,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .await
             .map_err(|error| error.to_string());
+            let should_restart = watcher_should_restart(&result);
             handle_watch_changes_result(result);
+            if !should_restart {
+                break;
+            }
             warn!(
                 "Display watcher will restart after {:?}",
                 WATCH_RESTART_DELAY
