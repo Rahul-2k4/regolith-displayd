@@ -86,10 +86,6 @@ fn finish_sway_watcher(
     }
 }
 
-fn watcher_should_restart(result: &Result<(), String>) -> bool {
-    result.is_err()
-}
-
 async fn supervise_sway_watcher<Watch, WatchFuture>(
     mut watch: Watch,
     restart_delay: Duration,
@@ -483,14 +479,6 @@ mod tests {
         assert!(
             matches!(result, Err(error) if error.to_string().contains("Display watcher task failed"))
         );
-    }
-
-    #[test]
-    fn restarts_after_initial_watcher_failure() {
-        assert!(watcher_should_restart(&Err(
-            "initial monitor info failed".to_string()
-        )));
-        assert!(!watcher_should_restart(&Ok(())));
     }
 
     #[tokio::test]
