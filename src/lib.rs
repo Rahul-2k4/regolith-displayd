@@ -24,6 +24,8 @@ lazy_static! {
 }
 
 const WATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+const WATCH_RETRY_ATTEMPTS: usize = 3;
+const WATCH_MAX_SIDE_EFFECT_ATTEMPTS: usize = WATCH_RETRY_ATTEMPTS * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaylandSideEffectStage {
@@ -652,14 +654,21 @@ where
     let mut reload_ready = profile.is_none();
     let mut state_committed = false;
 
+    let mut attempts = 0;
     loop {
+        attempts += 1;
         if !profile_ready {
             let profile_changed = match write_profile().await {
                 Ok(changed) => changed,
                 Err(error) => {
                     warn!("Unable to persist observed kanshi profile: {error}");
-                    tokio::time::sleep(WATCH_RETRY_DELAY).await;
-                    continue;
+                    if attempts < WATCH_MAX_SIDE_EFFECT_ATTEMPTS {
+                        tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(format!(
+                        "watch side effect failed after {WATCH_RETRY_ATTEMPTS} attempts"
+                    ));
                 }
             };
             profile_ready = true;
@@ -668,23 +677,38 @@ where
         if !reload_ready {
             if let Err(error) = reload().await {
                 warn!("Unable to reload kanshi after observed profile write: {error}");
-                tokio::time::sleep(WATCH_RETRY_DELAY).await;
-                continue;
+                if attempts < WATCH_MAX_SIDE_EFFECT_ATTEMPTS {
+                    tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(format!(
+                    "watch side effect failed after {WATCH_RETRY_ATTEMPTS} attempts"
+                ));
             }
             reload_ready = true;
         }
         if !state_committed {
             if let Err(error) = commit().await {
                 warn!("Unable to commit observed monitor state: {error}");
-                tokio::time::sleep(WATCH_RETRY_DELAY).await;
-                continue;
+                if attempts < WATCH_MAX_SIDE_EFFECT_ATTEMPTS {
+                    tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                    continue;
+                }
+                return Err(format!(
+                    "watch side effect failed after {WATCH_RETRY_ATTEMPTS} attempts"
+                ));
             }
             state_committed = true;
         }
         if let Err(error) = signal().await {
             warn!("Unable to emit MonitorsChanged after observed state update: {error}");
-            tokio::time::sleep(WATCH_RETRY_DELAY).await;
-            continue;
+            if attempts < WATCH_MAX_SIDE_EFFECT_ATTEMPTS {
+                tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                continue;
+            }
+            return Err(format!(
+                "watch side effect failed after {WATCH_MAX_SIDE_EFFECT_ATTEMPTS} attempts"
+            ));
         }
         return Ok(());
     }
@@ -1243,6 +1267,29 @@ mod tests {
         assert_eq!(
             *events.lock().unwrap(),
             vec!["write", "write", "reload", "reload", "signal", "signal"]
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_watch_side_effect_failure_is_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&attempts);
+        let result = retry_watch_side_effects(
+            None,
+            || async { Ok(false) },
+            || async { Ok(()) },
+            || async { Ok(()) },
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { Err("signal unavailable".to_string()) }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            WATCH_MAX_SIDE_EFFECT_ATTEMPTS
         );
     }
 

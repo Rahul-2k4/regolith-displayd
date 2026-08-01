@@ -56,8 +56,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let watch_handle = tokio::spawn(async move {
-        let result = DisplayManager::watch_changes(manager_ref, sway_connection_ref).await;
-        handle_watch_changes_result(result);
+        loop {
+            let result = DisplayManager::watch_changes(
+                Arc::clone(&manager_ref),
+                sway_connection_ref.clone(),
+            )
+            .await
+            .map_err(|error| error.to_string());
+            handle_watch_changes_result(result);
+            warn!(
+                "Display watcher will restart after {:?}",
+                WATCH_RESTART_DELAY
+            );
+            tokio::time::sleep(WATCH_RESTART_DELAY).await;
+        }
     });
 
     if let Err(e) = try_join!(watch_handle) {
@@ -67,7 +79,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn handle_watch_changes_result(result: Result<(), Box<dyn Error>>) {
+fn watcher_should_restart(result: &Result<(), String>) -> bool {
+    result.is_err()
+}
+
+fn handle_watch_changes_result(result: Result<(), String>) {
     if let Err(error) = result {
         error!("Display watcher stopped: {error}");
     }
@@ -77,6 +93,7 @@ const SWAY_CONNECT_ATTEMPTS: usize = 3;
 const SWAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WAYLAND_RETRY_DELAY: Duration = Duration::from_millis(100);
 const WAYLAND_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
+const WATCH_RESTART_DELAY: Duration = Duration::from_secs(1);
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
     value
@@ -358,6 +375,14 @@ fn process_wayland_candidate(
 mod tests {
     use super::*;
     use regolith_displayd::wayland_observer::{OutputHeadSnapshot, OutputModeSnapshot};
+
+    #[test]
+    fn restarts_after_initial_watcher_failure() {
+        assert!(watcher_should_restart(&Err(
+            "initial monitor info failed".to_string()
+        )));
+        assert!(!watcher_should_restart(&Ok(())));
+    }
 
     #[test]
     fn handles_watch_changes_error_without_panicking() {
