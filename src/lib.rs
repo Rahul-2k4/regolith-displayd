@@ -265,10 +265,6 @@ impl DisplayServer {
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
-        if let Some(sway_connection) = &self.sway_connection {
-            DisplayManager::get_monitor_info(sway_connection).await?;
-        }
-
         let mut connection = ZBUS_CONNECTION.lock().await;
         *connection = Some(
             ConnectionBuilder::session()?
@@ -764,7 +760,7 @@ mod tests {
     use crate::wayland_observer::{OutputHeadSnapshot, OutputModeSnapshot, OutputSnapshot};
 
     #[tokio::test]
-    async fn run_server_without_sway_connection_registers_dbus_server() {
+    async fn run_server_registers_dbus_without_sway_monitor_preflight() {
         let manager = Arc::new(Mutex::new(DisplayManager::new().await));
         let server = DisplayServer::new(manager, None).await;
 

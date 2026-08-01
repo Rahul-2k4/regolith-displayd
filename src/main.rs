@@ -15,7 +15,6 @@ use swayipc_async::Connection as SwayConection;
 use tokio::{
     sync::{oneshot, Mutex},
     task::JoinHandle,
-    try_join,
 };
 
 #[tokio::main]
@@ -26,18 +25,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let manager_ref = Arc::new(Mutex::new(manager));
     let sway_connection_ref = connect_sway_backend().await?;
 
-    let wayland_observer = if sway_connection_ref.is_none() {
-        start_wayland_state_observer(Arc::clone(&manager_ref))
-    } else {
-        None
-    };
-
-    let wayland_observer_handle = if let Some((handle, ready)) = wayland_observer {
-        if !wait_for_wayland_readiness(ready, WAYLAND_READINESS_TIMEOUT).await? {
-            warn!(
-                "Wayland observer readiness timed out after {:?}; registering D-Bus and continuing observation",
-                WAYLAND_READINESS_TIMEOUT
-            );
+    let wayland_observer_handle = if sway_connection_ref.is_none() {
+        let (handle, ready) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
+        match wait_for_wayland_readiness(ready, WAYLAND_READINESS_TIMEOUT).await {
+            Ok(false) => {
+                warn!(
+                    "Wayland observer readiness timed out after {:?}; registering D-Bus and continuing observation",
+                    WAYLAND_READINESS_TIMEOUT
+                );
+            }
+            Ok(true) => {}
+            Err(error) => {
+                let _ = handle.await;
+                return Err(error);
+            }
         }
         Some(handle)
     } else {
@@ -48,36 +49,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     server.run_server().await?;
 
     if let Some(observer_handle) = wayland_observer_handle {
-        tokio::spawn(async move {
-            if let Err(error) = observer_handle.await {
-                error!("Wayland observer task join failure: {error}");
-            }
-        });
+        let observer_result = match observer_handle.await {
+            Ok(result) => result,
+            Err(error) => return Err(format!("Wayland observer task failed: {error}").into()),
+        };
+        return finish_wayland_observer(observer_result);
     }
 
-    let watch_handle = tokio::spawn(async move {
-        loop {
-            let result = DisplayManager::watch_changes(
-                Arc::clone(&manager_ref),
-                sway_connection_ref.clone(),
-            )
-            .await
-            .map_err(|error| error.to_string());
-            let should_restart = watcher_should_restart(&result);
-            handle_watch_changes_result(result);
-            if !should_restart {
-                break;
+    let Some(sway_connection) = sway_connection_ref else {
+        return Err("No display observer is available".into());
+    };
+    let watch_handle = tokio::spawn(supervise_sway_watcher(
+        move || {
+            let manager_ref = Arc::clone(&manager_ref);
+            let sway_connection = Arc::clone(&sway_connection);
+            async move {
+                DisplayManager::watch_changes(manager_ref, Some(sway_connection))
+                    .await
+                    .map_err(|error| error.to_string())
             }
-            warn!(
-                "Display watcher will restart after {:?}",
-                WATCH_RESTART_DELAY
-            );
-            tokio::time::sleep(WATCH_RESTART_DELAY).await;
-        }
-    });
+        },
+        WATCH_RESTART_DELAY,
+    ));
 
-    if let Err(e) = try_join!(watch_handle) {
-        error!("{}", e);
+    if let Err(e) = watch_handle.await {
+        error!("{e}");
     }
     pending::<()>().await;
     Ok(())
@@ -87,9 +83,50 @@ fn watcher_should_restart(result: &Result<(), String>) -> bool {
     result.is_err()
 }
 
+async fn supervise_sway_watcher<Watch, WatchFuture>(
+    mut watch: Watch,
+    restart_delay: Duration,
+) -> Result<(), String>
+where
+    Watch: FnMut() -> WatchFuture,
+    WatchFuture: Future<Output = Result<(), String>>,
+{
+    loop {
+        let result = watch().await;
+        let should_restart = watcher_should_restart(&result);
+        handle_watch_changes_result(result);
+        if !should_restart {
+            return Ok(());
+        }
+        warn!("Display watcher will restart after {:?}", restart_delay);
+        tokio::time::sleep(restart_delay).await;
+    }
+}
+
 fn handle_watch_changes_result(result: Result<(), String>) {
     if let Err(error) = result {
         error!("Display watcher stopped: {error}");
+    }
+}
+
+fn finish_wayland_observer(result: Result<(), String>) -> Result<(), Box<dyn Error>> {
+    match result {
+        Ok(()) => {
+            info!("Wayland observer completed normally");
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn record_wayland_pending_failure(attempts: &mut usize, error: String) -> Result<(), String> {
+    *attempts += 1;
+    if *attempts >= WAYLAND_MAX_PENDING_ATTEMPTS {
+        Err(format!(
+            "Wayland pending side effect failed after {WAYLAND_MAX_PENDING_ATTEMPTS} attempts: {error}"
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -97,6 +134,7 @@ const SWAY_CONNECT_ATTEMPTS: usize = 3;
 const SWAY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WAYLAND_RETRY_DELAY: Duration = Duration::from_millis(100);
 const WAYLAND_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
+const WAYLAND_MAX_PENDING_ATTEMPTS: usize = 3;
 const WATCH_RESTART_DELAY: Duration = Duration::from_secs(1);
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
@@ -142,32 +180,32 @@ async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box
 
 fn start_wayland_state_observer(
     manager_ref: Arc<Mutex<DisplayManager>>,
-) -> Option<(JoinHandle<()>, oneshot::Receiver<Result<(), String>>)> {
-    match WaylandOutputObserver::observe() {
-        Ok(receiver) => {
-            let (ready_sender, ready_receiver) = oneshot::channel();
-            info!("Starting Wayland output observation for COSMIC without Sway");
-            let handle = tokio::task::spawn_blocking(move || {
-                consume_wayland_observer(manager_ref, receiver, Some(ready_sender));
-            });
-            Some((handle, ready_receiver))
-        }
-        Err(error) => {
-            warn!("Wayland output observation unavailable at startup: {error}");
-            None
-        }
-    }
+) -> Result<
+    (
+        JoinHandle<Result<(), String>>,
+        oneshot::Receiver<Result<(), String>>,
+    ),
+    Box<dyn Error>,
+> {
+    let receiver = WaylandOutputObserver::observe()?;
+    let (ready_sender, ready_receiver) = oneshot::channel();
+    info!("Starting Wayland output observation for COSMIC without Sway");
+    let handle = tokio::task::spawn_blocking(move || {
+        consume_wayland_observer(manager_ref, receiver, Some(ready_sender))
+    });
+    Ok((handle, ready_receiver))
 }
 
 fn consume_wayland_observer(
     manager_ref: Arc<Mutex<DisplayManager>>,
     receiver: std::sync::mpsc::Receiver<Result<OutputSnapshot, WaylandObserverError>>,
     mut ready_sender: Option<oneshot::Sender<Result<(), String>>>,
-) {
+) -> Result<(), String> {
     let runtime = tokio::runtime::Handle::current();
 
     let mut pending_manager = None;
     let mut pending_stage = None;
+    let mut pending_attempts = 0;
     // COSMIC snapshots use the same persistence and signal path as Sway observations.
     loop {
         let result = match pending_stage {
@@ -175,7 +213,7 @@ fn consume_wayland_observer(
                 Ok(result) => result,
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(manager) = pending_manager.clone() {
-                        process_wayland_candidate(
+                        let result = process_wayland_candidate(
                             &runtime,
                             &manager_ref,
                             Arc::new(Mutex::new(manager)),
@@ -184,14 +222,25 @@ fn consume_wayland_observer(
                             &mut pending_manager,
                             &mut ready_sender,
                         );
+                        if let Err(error) = result {
+                            if let Err(error) =
+                                record_wayland_pending_failure(&mut pending_attempts, error)
+                            {
+                                return Err(error);
+                            }
+                        } else {
+                            pending_attempts = 0;
+                        }
                     }
                     continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("Wayland observer receiver closed".to_string());
+                }
             },
             None => match receiver.recv() {
                 Ok(result) => result,
-                Err(_) => break,
+                Err(_) => return Err("Wayland observer receiver closed".to_string()),
             },
         };
         match result {
@@ -206,7 +255,7 @@ fn consume_wayland_observer(
                 ));
                 match install {
                     Ok(state_changed) => {
-                        process_wayland_candidate(
+                        let result = process_wayland_candidate(
                             &runtime,
                             &manager_ref,
                             candidate_manager,
@@ -215,6 +264,15 @@ fn consume_wayland_observer(
                             &mut pending_manager,
                             &mut ready_sender,
                         );
+                        if let Err(error) = result {
+                            if let Err(error) =
+                                record_wayland_pending_failure(&mut pending_attempts, error)
+                            {
+                                return Err(error);
+                            }
+                        } else {
+                            pending_attempts = 0;
+                        }
                     }
                     Err(error) => {
                         warn!(
@@ -229,15 +287,10 @@ fn consume_wayland_observer(
                 if let Some(sender) = ready_sender.take() {
                     let _ = sender.send(Err(error.to_string()));
                 }
-                break;
+                return Err(error.to_string());
             }
         }
     }
-
-    if let Some(sender) = ready_sender.take() {
-        let _ = sender.send(Err("Wayland observer receiver closed".to_string()));
-    }
-    info!("Wayland output observation receiver closed; state-only loop exiting");
 }
 
 fn notify_wayland_readiness(
@@ -291,7 +344,7 @@ fn process_wayland_candidate(
     pending_stage: &mut Option<WaylandSideEffectStage>,
     pending_manager: &mut Option<DisplayManager>,
     ready_sender: &mut Option<oneshot::Sender<Result<(), String>>>,
-) {
+) -> Result<(), String> {
     let candidate = runtime.block_on(async { candidate_manager.lock().await.clone() });
     runtime.block_on(publish_wayland_state_before_readiness(
         manager_ref,
@@ -310,7 +363,7 @@ fn process_wayland_candidate(
         runtime.block_on(async {
             *manager_ref.lock().await = candidate;
         });
-        return;
+        return Ok(());
     };
 
     if stage == WaylandSideEffectStage::Signal {
@@ -323,18 +376,19 @@ fn process_wayland_candidate(
                     .map_err(|error| error.to_string())
             },
         ));
-        match result {
+        return match result {
             Ok(()) => {
                 *pending_stage = None;
                 *pending_manager = None;
+                Ok(())
             }
             Err(error) => {
                 error!("Error emitting MonitorsChanged: {error}");
                 *pending_stage = Some(WaylandSideEffectStage::Signal);
                 *pending_manager = Some(candidate);
+                Err(error)
             }
-        }
-        return;
+        };
     }
 
     match runtime.block_on(DisplayManager::advance_wayland_side_effect(
@@ -355,22 +409,26 @@ fn process_wayland_candidate(
                 Ok(()) => {
                     *pending_stage = None;
                     *pending_manager = None;
+                    Ok(())
                 }
                 Err(error) => {
                     error!("Error emitting MonitorsChanged: {error}");
                     *pending_stage = Some(WaylandSideEffectStage::Signal);
                     *pending_manager = Some(candidate);
+                    Err(error)
                 }
             }
         }
         Ok(next_stage) => {
             *pending_stage = Some(next_stage);
             *pending_manager = Some(candidate);
+            Ok(())
         }
         Err(error) => {
             warn!("Unable to advance Wayland display side effects at {stage:?}: {error}");
             *pending_stage = Some(stage);
             *pending_manager = Some(candidate);
+            Err(error)
         }
     }
 }
@@ -386,6 +444,83 @@ mod tests {
             "initial monitor info failed".to_string()
         )));
         assert!(!watcher_should_restart(&Ok(())));
+    }
+
+    #[tokio::test]
+    async fn sway_supervisor_recovers_after_initial_monitor_info_failure() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let result = supervise_sway_watcher(
+            move || {
+                let attempt = attempt_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err("initial monitor info failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn sway_supervisor_does_not_restart_after_normal_completion() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let result = supervise_sway_watcher(
+            move || {
+                attempt_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            },
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn normal_wayland_completion_is_not_reclassified_as_failure() {
+        assert!(finish_wayland_observer(Ok(())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn closed_wayland_receiver_is_returned_by_consumer() {
+        let (sender, receiver) =
+            std::sync::mpsc::channel::<Result<OutputSnapshot, WaylandObserverError>>();
+        drop(sender);
+        let manager = Arc::new(Mutex::new(DisplayManager::new().await));
+        let result =
+            tokio::task::spawn_blocking(move || consume_wayland_observer(manager, receiver, None))
+                .await
+                .unwrap();
+
+        assert_eq!(result, Err("Wayland observer receiver closed".to_string()));
+    }
+
+    #[test]
+    fn terminal_wayland_failure_is_surfaced() {
+        let result = finish_wayland_observer(Err("observer disconnected".to_string()));
+        assert!(matches!(result, Err(error) if error.to_string() == "observer disconnected"));
+    }
+
+    #[test]
+    fn pending_wayland_side_effect_exhaustion_is_returned() {
+        let mut attempts = 0;
+        assert!(record_wayland_pending_failure(&mut attempts, "write failed".to_string()).is_ok());
+        assert!(record_wayland_pending_failure(&mut attempts, "write failed".to_string()).is_ok());
+        let result = record_wayland_pending_failure(&mut attempts, "write failed".to_string());
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("after 3 attempts") && error.contains("write failed")
+        ));
     }
 
     #[test]
