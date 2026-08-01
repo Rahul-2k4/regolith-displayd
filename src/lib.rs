@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::Command;
-use std::{error::Error, fs, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{error::Error, fs, path::PathBuf, sync::Arc, time::Duration};
 use swayipc_async::Connection;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::sleep};
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
@@ -103,6 +103,7 @@ impl DisplayServer {
         let profile_name = profile_name_for_monitors(&manager_obj.monitors);
         let profile_text = kanshi_profile_text(&manager_obj.monitors, &mutter_logical_monitors);
         info!("Profile FileName: {profile_name}");
+        drop(manager_obj);
 
         let profile_changed =
             match write_kanshi_profile_if_changed(&profile_name, &profile_text).await {
@@ -118,7 +119,7 @@ impl DisplayServer {
                 error!("Error reloading kanshi configuration: {e}");
             }
         }
-        if let Err(e) = manager_obj.get_monitor_info(&self.sway_connection).await {
+        if let Err(e) = DisplayManager::get_monitor_info(&self.sway_connection).await {
             error!("Error getting output information from sway: {e}");
         }
         DisplayManager::emit_monitors_changed().await?;
@@ -147,11 +148,7 @@ impl DisplayServer {
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
-        self.manager
-            .lock()
-            .await
-            .get_monitor_info(&self.sway_connection)
-            .await?;
+        DisplayManager::get_monitor_info(&self.sway_connection).await?;
 
         let mut connection = ZBUS_CONNECTION.lock().await;
         *connection = Some(
@@ -178,10 +175,7 @@ impl DisplayManager {
         manager_obj: Arc<Mutex<DisplayManager>>,
         sway_connection: Arc<Mutex<Connection>>,
     ) -> Result<(), Box<dyn Error>> {
-        let display_info = {
-            let mut manager_obj_lock = manager_obj.lock().await;
-            manager_obj_lock.get_monitor_info(&sway_connection).await?
-        };
+        let display_info = DisplayManager::get_monitor_info(&sway_connection).await?;
         let mut prev_monitor_set: HashSet<Monitor> = display_info.0.iter().cloned().collect();
         let mut prev_logical_monitor_set: HashSet<LogicalMonitor> =
             display_info.1.iter().cloned().collect();
@@ -191,19 +185,9 @@ impl DisplayManager {
             manager_obj_lock.logical_monitors = display_info.1;
         }
         loop {
-            thread::sleep(Duration::from_millis(700));
-            let display_info = {
-                let mut manager_obj_lock = manager_obj.lock().await;
-                manager_obj_lock.get_monitor_info(&sway_connection).await?
-            };
-            let mut monitor_set = HashSet::new();
-            let mut logical_monitor_set = HashSet::new();
-            for monitor in &display_info.0 {
-                monitor_set.insert(monitor.clone());
-            }
-            for logical_monitor in &display_info.1 {
-                logical_monitor_set.insert(logical_monitor.clone());
-            }
+            sleep(Duration::from_millis(700)).await;
+            let display_info = DisplayManager::get_monitor_info(&sway_connection).await?;
+            let (monitor_set, logical_monitor_set) = monitor_sets(&display_info.0, &display_info.1);
             if display_state_changed(
                 &prev_monitor_set,
                 &prev_logical_monitor_set,
@@ -247,8 +231,7 @@ impl DisplayManager {
     }
 
     /// Returns list of all monitors and logical monitors
-    pub async fn get_monitor_info<'a>(
-        &mut self,
+    pub async fn get_monitor_info(
         sway_connection: &Mutex<Connection>,
     ) -> Result<(Vec<Monitor>, Vec<LogicalMonitor>), Box<dyn Error>> {
         let outputs = sway_connection.lock().await.get_outputs().await?;
@@ -395,6 +378,16 @@ fn display_state_changed(
     current_logical_monitors: &HashSet<LogicalMonitor>,
 ) -> bool {
     prev_monitors != current_monitors || prev_logical_monitors != current_logical_monitors
+}
+
+fn monitor_sets(
+    monitors: &[Monitor],
+    logical_monitors: &[LogicalMonitor],
+) -> (HashSet<Monitor>, HashSet<LogicalMonitor>) {
+    (
+        monitors.iter().cloned().collect(),
+        logical_monitors.iter().cloned().collect(),
+    )
 }
 
 fn observed_profile<T: KanshiProfileEntry>(
@@ -599,6 +592,25 @@ mod tests {
             &current_monitors,
             &current_logical_monitors,
         ));
+    }
+
+    #[test]
+    fn builds_monitor_sets_from_display_info() {
+        let monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let logical_monitor =
+            LogicalMonitor::test_new("eDP-1", "1024x768@60Hz", 0, 0, 1.0, 0, true);
+
+        let (monitors, logical_monitors) =
+            monitor_sets(&[monitor.clone()], &[logical_monitor.clone()]);
+
+        assert_eq!(monitors, HashSet::from([monitor]));
+        assert_eq!(logical_monitors, HashSet::from([logical_monitor]));
     }
 
     #[test]
