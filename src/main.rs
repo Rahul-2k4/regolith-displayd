@@ -134,23 +134,44 @@ fn consume_wayland_observer(
     let runtime = tokio::runtime::Handle::current();
 
     let mut pending_side_effects = false;
+    let mut pending_manager = None;
     // COSMIC snapshots use the same persistence and signal path as Sway observations.
     while let Ok(result) = receiver.recv() {
         match result {
             Ok(snapshot) => {
+                let base_manager = pending_manager.clone().unwrap_or_else(|| {
+                    runtime.block_on(async { manager_ref.lock().await.clone() })
+                });
+                let candidate_manager = Arc::new(Mutex::new(base_manager));
                 let install = runtime.block_on(DisplayManager::install_wayland_snapshot(
-                    Arc::clone(&manager_ref),
+                    Arc::clone(&candidate_manager),
                     &snapshot,
                 ));
                 match install {
                     Ok(state_changed) => {
-                        if let Some(sender) = ready_sender.take() {
-                            let _ = sender.send(Ok(()));
-                        }
                         if wayland_side_effects_required(state_changed, pending_side_effects) {
-                            pending_side_effects = runtime.block_on(
-                                DisplayManager::persist_wayland_state(Arc::clone(&manager_ref)),
+                            pending_side_effects =
+                                runtime.block_on(DisplayManager::persist_wayland_state(
+                                    Arc::clone(&candidate_manager),
+                                    pending_side_effects,
+                                ));
+                        }
+                        if pending_side_effects {
+                            pending_manager = Some(
+                                runtime.block_on(async { candidate_manager.lock().await.clone() }),
                             );
+                        } else {
+                            pending_manager = None;
+                            if state_changed {
+                                let candidate = runtime
+                                    .block_on(async { candidate_manager.lock().await.clone() });
+                                runtime.block_on(async {
+                                    *manager_ref.lock().await = candidate;
+                                });
+                            }
+                            if let Some(sender) = ready_sender.take() {
+                                let _ = sender.send(Ok(()));
+                            }
                         }
                     }
                     Err(error) => {

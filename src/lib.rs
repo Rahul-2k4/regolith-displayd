@@ -23,6 +23,8 @@ lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
 }
 
+const WATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 /// Stores configrations, interacts with sway IPC and monitors hardware changes
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 pub struct DisplayManager {
@@ -34,6 +36,10 @@ pub struct DisplayManager {
 
 pub fn wayland_side_effects_required(state_changed: bool, pending_side_effects: bool) -> bool {
     state_changed || pending_side_effects
+}
+
+pub fn wayland_reload_required(profile_changed: bool, pending_side_effects: bool) -> bool {
+    profile_changed || pending_side_effects
 }
 
 /// DBus Interface for providing bindings
@@ -264,7 +270,13 @@ impl DisplayManager {
         }
         loop {
             tokio::time::sleep(Duration::from_millis(700)).await;
-            let display_info = DisplayManager::get_monitor_info(&sway_connection).await?;
+            let display_info = match DisplayManager::get_monitor_info(&sway_connection).await {
+                Ok(display_info) => display_info,
+                Err(error) => {
+                    warn!("Unable to refresh output information from sway: {error}");
+                    continue;
+                }
+            };
             let mut monitor_set = HashSet::new();
             let mut logical_monitor_set = HashSet::new();
             for monitor in &display_info.0 {
@@ -280,6 +292,35 @@ impl DisplayManager {
                 &logical_monitor_set,
             ) {
                 let profile = observed_profile(&display_info.0, &display_info.1);
+                let side_effects = retry_watch_side_effects(
+                    profile
+                        .as_ref()
+                        .map(|(name, text)| (name.as_str(), text.as_str())),
+                    || async {
+                        write_kanshi_profile_if_changed(
+                            profile
+                                .as_ref()
+                                .map(|(name, _)| name.as_str())
+                                .unwrap_or_default(),
+                            profile
+                                .as_ref()
+                                .map(|(_, text)| text.as_str())
+                                .unwrap_or_default(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                    },
+                    || async { reload_kanshi().await.map_err(|error| error.to_string()) },
+                    || async {
+                        Self::emit_monitors_changed()
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                )
+                .await;
+                if side_effects.is_err() {
+                    continue;
+                }
                 {
                     let mut manager_obj_lock = manager_obj.lock().await;
                     manager_obj_lock.replace_observed_state(display_info.0, display_info.1);
@@ -288,12 +329,6 @@ impl DisplayManager {
                 }
                 prev_monitor_set = monitor_set;
                 prev_logical_monitor_set = logical_monitor_set;
-                if let Some((profile_name, profile_text)) = profile {
-                    if write_kanshi_profile_if_changed(&profile_name, &profile_text).await? {
-                        reload_kanshi().await?;
-                    }
-                }
-                Self::emit_monitors_changed().await?;
             }
         }
     }
@@ -336,20 +371,24 @@ impl DisplayManager {
         manager.replace_from_wayland_snapshot(snapshot)
     }
 
-    pub async fn persist_wayland_state(manager_obj: Arc<Mutex<DisplayManager>>) -> bool {
+    pub async fn persist_wayland_state(
+        manager_obj: Arc<Mutex<DisplayManager>>,
+        pending_side_effects: bool,
+    ) -> bool {
         let profile = {
             let manager = manager_obj.lock().await;
             observed_profile(&manager.monitors, &manager.logical_monitors)
         };
         if let Some((name, text)) = profile {
             match write_kanshi_profile_if_changed(&name, &text).await {
-                Ok(true) => {
-                    if let Err(error) = reload_kanshi().await {
-                        error!("Error reloading kanshi configuration: {}", error);
-                        return true;
+                Ok(profile_changed) => {
+                    if wayland_reload_required(profile_changed, pending_side_effects) {
+                        if let Err(error) = reload_kanshi().await {
+                            error!("Error reloading kanshi configuration: {}", error);
+                            return true;
+                        }
                     }
                 }
-                Ok(false) => {}
                 Err(error) => {
                     error!("Error writing data to kanshi config file: {}", error);
                     return true;
@@ -536,6 +575,53 @@ fn get_disabled_monitors<'a>(
         .iter()
         .filter(|mon| !active_physical_monitors.contains(mon))
         .collect()
+}
+
+async fn retry_watch_side_effects<Write, WriteFuture, Reload, ReloadFuture, Signal, SignalFuture>(
+    profile: Option<(&str, &str)>,
+    mut write_profile: Write,
+    mut reload: Reload,
+    mut signal: Signal,
+) -> Result<(), String>
+where
+    Write: FnMut() -> WriteFuture,
+    WriteFuture: Future<Output = Result<bool, String>>,
+    Reload: FnMut() -> ReloadFuture,
+    ReloadFuture: Future<Output = Result<(), String>>,
+    Signal: FnMut() -> SignalFuture,
+    SignalFuture: Future<Output = Result<(), String>>,
+{
+    let mut profile_ready = profile.is_none();
+    let mut reload_ready = profile.is_none();
+
+    loop {
+        if !profile_ready {
+            let profile_changed = match write_profile().await {
+                Ok(changed) => changed,
+                Err(error) => {
+                    warn!("Unable to persist observed kanshi profile: {error}");
+                    tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                    continue;
+                }
+            };
+            profile_ready = true;
+            reload_ready = !profile_changed;
+        }
+        if !reload_ready {
+            if let Err(error) = reload().await {
+                warn!("Unable to reload kanshi after observed profile write: {error}");
+                tokio::time::sleep(WATCH_RETRY_DELAY).await;
+                continue;
+            }
+            reload_ready = true;
+        }
+        if let Err(error) = signal().await {
+            warn!("Unable to emit MonitorsChanged after observed state update: {error}");
+            tokio::time::sleep(WATCH_RETRY_DELAY).await;
+            continue;
+        }
+        return Ok(());
+    }
 }
 
 fn display_state_changed(
@@ -993,6 +1079,66 @@ mod tests {
         assert!(!wayland_side_effects_required(false, false));
         assert!(wayland_side_effects_required(true, false));
         assert!(wayland_side_effects_required(false, true));
+        assert!(wayland_reload_required(false, true));
+    }
+    #[tokio::test]
+    async fn retries_transient_watch_side_effect_failures_before_publishing_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let writes = Arc::new(AtomicUsize::new(0));
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let signals = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let write_count = Arc::clone(&writes);
+        let write_events = Arc::clone(&events);
+        let reload_count = Arc::clone(&reloads);
+        let reload_events = Arc::clone(&events);
+        let signal_count = Arc::clone(&signals);
+        let signal_events = Arc::clone(&events);
+        retry_watch_side_effects(
+            Some(("profile", "text")),
+            move || {
+                let attempt = write_count.fetch_add(1, Ordering::SeqCst);
+                write_events.lock().unwrap().push("write");
+                async move {
+                    if attempt == 0 {
+                        Err("write failed".to_string())
+                    } else {
+                        Ok(true)
+                    }
+                }
+            },
+            move || {
+                let attempt = reload_count.fetch_add(1, Ordering::SeqCst);
+                reload_events.lock().unwrap().push("reload");
+                async move {
+                    if attempt == 0 {
+                        Err("reload failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            move || {
+                let attempt = signal_count.fetch_add(1, Ordering::SeqCst);
+                signal_events.lock().unwrap().push("signal");
+                async move {
+                    if attempt == 0 {
+                        Err("signal failed".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 2);
+        assert_eq!(reloads.load(Ordering::SeqCst), 2);
+        assert_eq!(signals.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["write", "write", "reload", "reload", "signal", "signal"]
+        );
     }
 
     #[test]
