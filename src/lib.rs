@@ -41,12 +41,16 @@ pub struct DisplayServer {
     // TODO: Make independent of sway
     sway_connection: Option<Arc<Mutex<Connection>>>,
 }
-fn apply_refreshed_monitor_info(
+fn commit_refreshed_monitor_info(
     manager: &mut DisplayManager,
-    (monitors, logical_monitors): (Vec<Monitor>, Vec<LogicalMonitor>),
-) {
+    properties: DisplayManagerProperties,
+    refreshed: Result<(Vec<Monitor>, Vec<LogicalMonitor>), String>,
+) -> Result<(), String> {
+    let (monitors, logical_monitors) = refreshed?;
+    manager.properties = properties;
     manager.monitors = monitors;
     manager.logical_monitors = logical_monitors;
+    Ok(())
 }
 
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
@@ -117,8 +121,6 @@ impl DisplayServer {
             return Ok(());
         }
 
-        manager_obj.properties = properties;
-
         let profile_name = profile_name_for_monitors(&manager_obj.monitors);
         let profile_text = kanshi_profile_text(&manager_obj.monitors, &mutter_logical_monitors);
         info!("Profile FileName: {profile_name}");
@@ -137,18 +139,22 @@ impl DisplayServer {
                 error!("Error reloading kanshi configuration: {e}");
             }
         }
-        let refreshed_monitor_info = match DisplayManager::get_monitor_info(sway_connection).await {
-            Ok(display_info) => display_info,
-            Err(e) => {
-                error!(
-                    "Error getting output information from sway after applying configuration: {e}"
-                );
-                return Err(zbus::fdo::Error::Failed(format!(
-                    "Unable to refresh output information from sway: {e}"
-                )));
-            }
-        };
-        apply_refreshed_monitor_info(&mut manager_obj, refreshed_monitor_info);
+        let refreshed_monitor_info = DisplayManager::get_monitor_info(sway_connection)
+            .await
+            .map_err(|e| e.to_string());
+        // Kanshi may already have changed the compositor. Report failure when
+        // Sway cannot confirm the result, while keeping the D-Bus manager state
+        // unchanged instead of exposing a partially committed configuration.
+        if let Err(e) =
+            commit_refreshed_monitor_info(&mut manager_obj, properties, refreshed_monitor_info)
+        {
+            error!(
+                "Unable to refresh output information from sway after applying configuration: {e}"
+            );
+            return Err(zbus::fdo::Error::Failed(format!(
+                "Unable to refresh output information from sway: {e}"
+            )));
+        }
         DisplayManager::emit_monitors_changed().await?;
         Ok(())
     }
@@ -596,16 +602,49 @@ mod tests {
             LogicalMonitor::test_new("eDP-1", "1920x1080@60Hz", 0, 0, 1.0, 0, true);
         let mut manager = build_manager(vec![previous_monitor], Vec::new());
 
-        apply_refreshed_monitor_info(
+        let properties = DisplayManagerProperties {
+            layout: Some(1),
+            ..DisplayManagerProperties::new()
+        };
+        commit_refreshed_monitor_info(
             &mut manager,
-            (
+            properties.clone(),
+            Ok((
                 vec![refreshed_monitor.clone()],
                 vec![refreshed_logical.clone()],
-            ),
-        );
+            )),
+        )
+        .unwrap();
 
+        assert_eq!(manager.properties, properties);
         assert_eq!(manager.monitors, vec![refreshed_monitor]);
         assert_eq!(manager.logical_monitors, vec![refreshed_logical]);
+    }
+
+    #[test]
+    fn refresh_failure_does_not_partially_mutate_manager_state() {
+        let previous_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let mut manager = build_manager(vec![previous_monitor], Vec::new());
+        let previous = manager.clone();
+        let properties = DisplayManagerProperties {
+            layout: Some(1),
+            ..DisplayManagerProperties::new()
+        };
+
+        let result = commit_refreshed_monitor_info(
+            &mut manager,
+            properties,
+            Err("refresh failed".to_string()),
+        );
+
+        assert_eq!(result, Err("refresh failed".to_string()));
+        assert_eq!(manager, previous);
     }
 
     fn snapshot_head(
