@@ -41,6 +41,13 @@ pub struct DisplayServer {
     // TODO: Make independent of sway
     sway_connection: Option<Arc<Mutex<Connection>>>,
 }
+fn apply_refreshed_monitor_info(
+    manager: &mut DisplayManager,
+    (monitors, logical_monitors): (Vec<Monitor>, Vec<LogicalMonitor>),
+) {
+    manager.monitors = monitors;
+    manager.logical_monitors = logical_monitors;
+}
 
 #[derive(Debug, Clone, SerializeDict, DeserializeDict, Type, PartialEq)]
 #[zvariant(signature = "dict")]
@@ -130,9 +137,18 @@ impl DisplayServer {
                 error!("Error reloading kanshi configuration: {e}");
             }
         }
-        if let Err(e) = DisplayManager::get_monitor_info(sway_connection).await {
-            error!("Error getting output information from sway: {e}");
-        }
+        let refreshed_monitor_info = match DisplayManager::get_monitor_info(sway_connection).await {
+            Ok(display_info) => display_info,
+            Err(e) => {
+                error!(
+                    "Error getting output information from sway after applying configuration: {e}"
+                );
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Unable to refresh output information from sway: {e}"
+                )));
+            }
+        };
+        apply_refreshed_monitor_info(&mut manager_obj, refreshed_monitor_info);
         DisplayManager::emit_monitors_changed().await?;
         Ok(())
     }
@@ -558,6 +574,38 @@ mod tests {
             logical_monitors,
             properties: DisplayManagerProperties::new(),
         }
+    }
+
+    #[test]
+    fn commits_refreshed_monitor_info_before_signal_state_is_observable() {
+        let previous_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1024x768@60Hz")],
+        );
+        let refreshed_monitor = Monitor::test_new(
+            "eDP-1",
+            "Regolith",
+            "Panel",
+            "A1",
+            vec![Modes::test_new("1920x1080@60Hz")],
+        );
+        let refreshed_logical =
+            LogicalMonitor::test_new("eDP-1", "1920x1080@60Hz", 0, 0, 1.0, 0, true);
+        let mut manager = build_manager(vec![previous_monitor], Vec::new());
+
+        apply_refreshed_monitor_info(
+            &mut manager,
+            (
+                vec![refreshed_monitor.clone()],
+                vec![refreshed_logical.clone()],
+            ),
+        );
+
+        assert_eq!(manager.monitors, vec![refreshed_monitor]);
+        assert_eq!(manager.logical_monitors, vec![refreshed_logical]);
     }
 
     fn snapshot_head(
