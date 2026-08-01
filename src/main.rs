@@ -7,7 +7,7 @@ use regolith_displayd::{
 };
 use std::{
     error::Error,
-    future::{pending, Future},
+    future::Future,
     sync::{mpsc::RecvTimeoutError, Arc},
     time::Duration,
 };
@@ -72,11 +72,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         WATCH_RESTART_DELAY,
     ));
 
-    if let Err(e) = watch_handle.await {
-        error!("{e}");
+    return finish_sway_watcher(watch_handle.await);
+}
+
+fn finish_sway_watcher(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+) -> Result<(), Box<dyn Error>> {
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(format!("Display watcher task failed: {error}").into()),
     }
-    pending::<()>().await;
-    Ok(())
 }
 
 fn watcher_should_restart(result: &Result<(), String>) -> bool {
@@ -437,6 +443,25 @@ fn process_wayland_candidate(
 mod tests {
     use super::*;
     use regolith_displayd::wayland_observer::{OutputHeadSnapshot, OutputModeSnapshot};
+
+    #[test]
+    fn sway_supervisor_normal_completion_returns_cleanly() {
+        assert!(finish_sway_watcher(Ok(Ok(()))).is_ok());
+    }
+
+    #[test]
+    fn sway_supervisor_join_failure_is_returned() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(async {
+            let handle = tokio::spawn(async {
+                panic!("watcher panic");
+            });
+            finish_sway_watcher(handle.await)
+        });
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("Display watcher task failed"))
+        );
+    }
 
     #[test]
     fn restarts_after_initial_watcher_failure() {
