@@ -7,7 +7,7 @@ build: extract-vendor
 	CARGO_HOME=debian/tmp_files/.cargo cargo build --release $(if $(filter 1,$(VENDOR)),--frozen --offline,)
 
 clean:
-	rm -rf vendor debian/tmp_files/.cargo
+	rm -rf vendor .cargo/config .cargo/config.toml debian/tmp_files/.cargo
 	cargo clean
 
 distclean: clean
