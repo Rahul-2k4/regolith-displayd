@@ -23,9 +23,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // New pointer to Display Manager Object
     let manager = DisplayManager::new().await;
     let manager_ref = Arc::new(Mutex::new(manager));
-    let sway_connection_ref = connect_sway_backend().await?;
+    let cosmic = cosmic_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref());
+    let sway_connection_ref = if cosmic {
+        None
+    } else {
+        connect_sway_backend().await?
+    };
+    let use_wayland = use_wayland_observer(cosmic, sway_connection_ref.is_none());
 
-    let wayland_observer_handle = if sway_connection_ref.is_none() {
+    let wayland_observer_handle = if use_wayland {
         let (handle, ready) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
         match wait_for_wayland_readiness(ready, WAYLAND_READINESS_TIMEOUT).await {
             Ok(false) => {
@@ -45,7 +51,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    let server = DisplayServer::new(Arc::clone(&manager_ref), sway_connection_ref.clone()).await;
+    let server = DisplayServer::new(
+        Arc::clone(&manager_ref),
+        if use_wayland {
+            None
+        } else {
+            sway_connection_ref.clone()
+        },
+    )
+    .await;
     server.run_server().await?;
 
     if let Some(observer_handle) = wayland_observer_handle {
@@ -153,6 +167,10 @@ const WAYLAND_RETRY_DELAY: Duration = Duration::from_millis(100);
 const WAYLAND_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const WAYLAND_MAX_PENDING_ATTEMPTS: usize = 3;
 const WATCH_RESTART_DELAY: Duration = Duration::from_secs(1);
+
+fn use_wayland_observer(cosmic: bool, sway_available: bool) -> bool {
+    cosmic || !sway_available
+}
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
     value
@@ -601,6 +619,21 @@ mod tests {
     #[test]
     fn identifies_cosmic_desktop_in_composite_value() {
         assert!(cosmic_desktop(Some("GNOME:COSMIC")));
+    }
+
+    #[test]
+    fn cosmic_prefers_wayland_even_when_sway_is_available() {
+        assert!(use_wayland_observer(true, true));
+    }
+
+    #[test]
+    fn gnome_prefers_sway_when_sway_is_available() {
+        assert!(!use_wayland_observer(false, true));
+    }
+
+    #[test]
+    fn gnome_uses_wayland_when_sway_is_unavailable() {
+        assert!(use_wayland_observer(false, false));
     }
 
     #[test]
