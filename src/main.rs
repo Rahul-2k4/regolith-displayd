@@ -24,15 +24,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let manager = DisplayManager::new().await;
     let manager_ref = Arc::new(Mutex::new(manager));
     let cosmic = cosmic_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref());
-    let (backend, sway_connection_ref) = if cosmic {
-        (select_display_backend(true, false), None)
-    } else {
-        let connection = connect_sway_backend().await?;
-        (
-            select_display_backend(false, connection.is_some()),
-            connection,
-        )
-    };
+    let sway_connection_ref = connect_sway_backend().await?;
+    let backend = select_display_backend(cosmic, sway_connection_ref.is_some());
 
     let wayland_observer_handle = if backend == DisplayBackend::Wayland {
         let (handle, ready) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
@@ -54,15 +47,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    let server = DisplayServer::new(
-        Arc::clone(&manager_ref),
-        if backend == DisplayBackend::Wayland {
-            None
-        } else {
-            sway_connection_ref.clone()
-        },
-    )
-    .await;
+    // COSMIC observes output events through Wayland while retaining Sway IPC for D-Bus compatibility.
+    let server = DisplayServer::new(Arc::clone(&manager_ref), sway_connection_ref.clone()).await;
     server.run_server().await?;
 
     if let Some(observer_handle) = wayland_observer_handle {
@@ -194,6 +180,7 @@ fn cosmic_desktop(value: Option<&str>) -> bool {
 }
 
 async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box<dyn Error>> {
+    let cosmic = cosmic_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref());
     let mut last_error = None;
 
     for attempt in 1..=SWAY_CONNECT_ATTEMPTS {
@@ -216,7 +203,14 @@ async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box
         "Sway IPC backend unavailable after {SWAY_CONNECT_ATTEMPTS} attempts: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
     );
-    Err(message.into())
+    if cosmic {
+        warn!(
+            "{message}; continuing without the Sway backend and switching to Wayland output observation"
+        );
+        Ok(None)
+    } else {
+        Err(message.into())
+    }
 }
 
 fn start_wayland_state_observer(
@@ -230,7 +224,7 @@ fn start_wayland_state_observer(
 > {
     let receiver = WaylandOutputObserver::observe()?;
     let (ready_sender, ready_receiver) = oneshot::channel();
-    info!("Starting Wayland output observation for COSMIC without Sway");
+    info!("Starting Wayland output observation for COSMIC");
     let handle = tokio::task::spawn_blocking(move || {
         consume_wayland_observer(manager_ref, receiver, Some(ready_sender))
     });
