@@ -1,7 +1,5 @@
 [Unit]
 Description=Start Kanshi for Regolith
-After=cosmic-session.target
-Conflicts=cosmic-session.target
 PartOf=graphical-session.target
 PartOf=regolith-gnome.target
 StartLimitIntervalSec=10
@@ -9,6 +7,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+ExecCondition=/bin/sh -c 'case "${XDG_CURRENT_DESKTOP:-}" in *GNOME*) exit 0;; *) exit 1;; esac'
 ExecStart=/usr/bin/kanshi -c %h/.config/regolith3/kanshi/config
 Restart=on-failure
 

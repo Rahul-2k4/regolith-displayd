@@ -11,15 +11,32 @@ section_has_key() {
     local file="$1" section="$2" key="$3"
     awk -v wanted="[$section]" -v key="$key" '
         /^\[/ { current = $0 }
-        current == wanted && $0 ~ "^" key "=" { found = 1 }
+        current == wanted {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            split(line, fields, "=")
+            lhs = fields[1]
+            sub(/[[:space:]]*$/, "", lhs)
+            if (lhs == key) { found = 1 }
+        }
         END { exit found ? 0 : 1 }
     ' "$file"
 }
-section_has_line() {
-    local file="$1" section="$2" expected="$3"
-    awk -v wanted="[$section]" -v expected="$expected" '
+section_has_setting() {
+    local file="$1" section="$2" key="$3" expected="$4"
+    awk -v wanted="[$section]" -v key="$key" -v expected="$expected" '
         /^\[/ { current = $0 }
-        current == wanted && $0 == expected { found = 1 }
+        current == wanted {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            split(line, fields, "=")
+            lhs = fields[1]
+            sub(/[[:space:]]*$/, "", lhs)
+            value = line
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            if (lhs == key && value == expected) { found = 1 }
+        }
         END { exit found ? 0 : 1 }
     ' "$file"
 }
@@ -41,6 +58,6 @@ if grep -Fq "Before=regolith-init-kanshi.service" "$DISPLAYD_SERVICE"; then fail
 check_common_metadata "$KANSHI_SERVICE"
 has_line "$KANSHI_SERVICE" "PartOf=regolith-gnome.target" || fail "kanshi target ownership is missing"
 has_line "$KANSHI_SERVICE" "WantedBy=regolith-gnome.target" || fail "kanshi target install wiring is missing"
-section_has_line "$KANSHI_SERVICE" Unit "After=cosmic-session.target" || fail "kanshi must start after cosmic session target"
-section_has_line "$KANSHI_SERVICE" Unit "Conflicts=cosmic-session.target" || fail "kanshi must conflict with cosmic session target"
+GNOME_KANSHI_CONDITION="/bin/sh -c 'case \"\${XDG_CURRENT_DESKTOP:-}\" in *GNOME*) exit 0;; *) exit 1;; esac'"
+section_has_setting "$KANSHI_SERVICE" Service ExecCondition "$GNOME_KANSHI_CONDITION" || fail "kanshi must have a GNOME-only ExecCondition"
 echo "displayd systemd metadata: PASS"
