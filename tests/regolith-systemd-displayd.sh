@@ -75,7 +75,16 @@ run_condition() {
     condition_body="${condition_body%'}"
     XDG_CURRENT_DESKTOP="$1" /bin/sh -c "$condition_body"
 }
-run_condition GNOME || fail "kanshi condition rejected GNOME"
-if run_condition COSMIC; then fail "kanshi condition allowed COSMIC"; fi
-if run_condition COSMIC:GNOME; then fail "kanshi condition allowed COSMIC:GNOME"; fi
+assert_condition_status() {
+    local desktop="$1" expected="$2" actual
+    if run_condition "$desktop"; then
+        actual=0
+    else
+        actual=$?
+    fi
+    [ "$actual" -eq "$expected" ] || fail "kanshi condition for $desktop returned $actual, expected $expected"
+}
+assert_condition_status GNOME 0
+assert_condition_status COSMIC 1
+assert_condition_status COSMIC:GNOME 1
 echo "displayd systemd metadata: PASS"
