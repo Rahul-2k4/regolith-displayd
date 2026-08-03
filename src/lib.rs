@@ -67,12 +67,8 @@ pub fn wayland_side_effect_stage(
     }
 }
 
-pub fn wayland_stage_after_profile(profile_changed: bool) -> WaylandSideEffectStage {
-    if profile_changed {
-        WaylandSideEffectStage::ReloadKanshi
-    } else {
-        WaylandSideEffectStage::Signal
-    }
+pub fn wayland_stage_after_profile(_profile_changed: bool) -> WaylandSideEffectStage {
+    WaylandSideEffectStage::Signal
 }
 
 pub fn wayland_stage_after_reload() -> WaylandSideEffectStage {
@@ -1193,10 +1189,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_and_reload_success_advance_to_signal_without_replaying_reload() {
+    fn cosmic_wayland_profile_persistence_advances_directly_to_signal() {
         assert_eq!(
             wayland_stage_after_profile(true),
-            WaylandSideEffectStage::ReloadKanshi
+            WaylandSideEffectStage::Signal
         );
         assert_eq!(
             wayland_stage_after_profile(false),
