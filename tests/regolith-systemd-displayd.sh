@@ -17,11 +17,21 @@ section_has_key() {
             split(line, fields, "=")
             lhs = fields[1]
             sub(/[[:space:]]*$/, "", lhs)
-            if (lhs == key) { found = 1 }
+            if (line ~ /=/ && lhs == key) { found = 1 }
         }
         END { exit found ? 0 : 1 }
     ' "$file"
 }
+valid_parser_fixture=$(mktemp)
+invalid_parser_fixture=$(mktemp)
+printf '[Unit]\n  StartLimitIntervalSec = 10\n' > "$valid_parser_fixture"
+printf '[Unit]\nStartLimitIntervalSec\n' > "$invalid_parser_fixture"
+section_has_key "$valid_parser_fixture" Unit StartLimitIntervalSec || fail "section_has_key rejected whitespace around '='"
+if section_has_key "$invalid_parser_fixture" Unit StartLimitIntervalSec; then
+    rm -f "$valid_parser_fixture" "$invalid_parser_fixture"
+    fail "section_has_key accepted a bare key without '='"
+fi
+rm -f "$valid_parser_fixture" "$invalid_parser_fixture"
 section_has_setting() {
     local file="$1" section="$2" key="$3" expected="$4"
     awk -v wanted="[$section]" -v key="$key" -v expected="$expected" '
