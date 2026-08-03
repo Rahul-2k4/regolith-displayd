@@ -1,5 +1,7 @@
 [Unit]
 Description=Start Kanshi for Regolith
+After=cosmic-session.target
+Conflicts=cosmic-session.target
 PartOf=graphical-session.target
 PartOf=regolith-gnome.target
 StartLimitIntervalSec=10

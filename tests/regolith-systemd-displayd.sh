@@ -15,6 +15,14 @@ section_has_key() {
         END { exit found ? 0 : 1 }
     ' "$file"
 }
+section_has_line() {
+    local file="$1" section="$2" expected="$3"
+    awk -v wanted="[$section]" -v expected="$expected" '
+        /^\[/ { current = $0 }
+        current == wanted && $0 == expected { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$file"
+}
 check_common_metadata() {
     local service="$1"
     [ -f "$service" ] || fail "missing service: $service"
@@ -33,4 +41,6 @@ if grep -Fq "Before=regolith-init-kanshi.service" "$DISPLAYD_SERVICE"; then fail
 check_common_metadata "$KANSHI_SERVICE"
 has_line "$KANSHI_SERVICE" "PartOf=regolith-gnome.target" || fail "kanshi target ownership is missing"
 has_line "$KANSHI_SERVICE" "WantedBy=regolith-gnome.target" || fail "kanshi target install wiring is missing"
+section_has_line "$KANSHI_SERVICE" Unit "After=cosmic-session.target" || fail "kanshi must start after cosmic session target"
+section_has_line "$KANSHI_SERVICE" Unit "Conflicts=cosmic-session.target" || fail "kanshi must conflict with cosmic session target"
 echo "displayd systemd metadata: PASS"
