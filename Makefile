@@ -16,7 +16,7 @@ distclean: clean
 vendor:
 	rm -rf vendor
 	mkdir -p .cargo
-	@set -eu; tmp=$$(mktemp); trap 'rm -f "$$tmp"' EXIT; cargo vendor --locked > "$$tmp"; sed '$$d' "$$tmp" > .cargo/config; echo 'directory = "vendor"' >> .cargo/config; tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf vendor.tar vendor; rm -rf vendor
+	@set -eu; tmp=$$(mktemp); trap 'rm -f "$$tmp"' EXIT; cargo vendor --locked > "$$tmp"; sed '$$d' "$$tmp" > .cargo/config; echo 'directory = "vendor"' >> .cargo/config; tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf vendor.tar vendor .cargo/config; rm -rf vendor
 
 extract-vendor:
 ifeq ($(VENDOR),1)

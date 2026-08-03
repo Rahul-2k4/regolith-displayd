@@ -1,0 +1,2 @@
+--extend-diff-ignore=^\.cargo/config$
+--extend-diff-ignore=^\.cargo/config.toml$
