@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         connect_sway_backend().await?
     };
-    let use_wayland = use_wayland_observer(cosmic, sway_connection_ref.is_none());
+    let use_wayland = use_wayland_observer(cosmic);
 
     let wayland_observer_handle = if use_wayland {
         let (handle, ready) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
@@ -168,8 +168,8 @@ const WAYLAND_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const WAYLAND_MAX_PENDING_ATTEMPTS: usize = 3;
 const WATCH_RESTART_DELAY: Duration = Duration::from_secs(1);
 
-fn use_wayland_observer(cosmic: bool, sway_available: bool) -> bool {
-    cosmic || !sway_available
+fn use_wayland_observer(cosmic: bool) -> bool {
+    cosmic
 }
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
@@ -623,17 +623,17 @@ mod tests {
 
     #[test]
     fn cosmic_prefers_wayland_even_when_sway_is_available() {
-        assert!(use_wayland_observer(true, true));
+        assert!(use_wayland_observer(true));
     }
 
     #[test]
-    fn gnome_prefers_sway_when_sway_is_available() {
-        assert!(!use_wayland_observer(false, true));
+    fn cosmic_prefers_wayland_without_sway() {
+        assert!(use_wayland_observer(true));
     }
 
     #[test]
-    fn gnome_uses_wayland_when_sway_is_unavailable() {
-        assert!(use_wayland_observer(false, false));
+    fn gnome_without_sway_does_not_select_wayland() {
+        assert!(!use_wayland_observer(false));
     }
 
     #[test]
