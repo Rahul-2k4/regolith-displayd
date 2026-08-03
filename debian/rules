@@ -16,7 +16,7 @@ override_dh_auto_build:
 	dh_auto_build -- $(MAKE_BUILD_VARS)
 
 override_dh_auto_clean:
-	ischroot && $(MAKE) clean || $(MAKE) distclean
+	$(MAKE) clean
 ifeq ($(VENDOR),1)
-	ischroot || $(MAKE) vendor
+	if ! ischroot; then $(MAKE) vendor; fi
 endif

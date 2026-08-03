@@ -13,14 +13,9 @@ distclean: clean
 	rm -rf .cargo vendor vendor.tar debian/tmp_files/.cargo
 
 vendor:
-	mkdir -p .cargo
-	cargo vendor | head -n -1 > .cargo/config
-	echo 'directory = "vendor"' >> .cargo/config
-	tar pcf vendor.tar vendor
-	rm -rf vendor
+	@set -eu; tmp=$$(mktemp); trap 'rm -f "$$tmp"' EXIT; cargo vendor --locked > "$$tmp"; sed '$$d' "$$tmp" > .cargo/config; echo 'directory = "vendor"' >> .cargo/config; tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -cf vendor.tar vendor; rm -rf vendor
 
 extract-vendor:
 ifeq ($(VENDOR),1)
-	rm -rf vendor
-	tar pxf vendor.tar
+	@if test -f vendor.tar; then rm -rf vendor; tar pxf vendor.tar; else $(MAKE) vendor; rm -rf vendor; tar pxf vendor.tar; fi
 endif
