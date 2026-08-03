@@ -24,14 +24,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let manager = DisplayManager::new().await;
     let manager_ref = Arc::new(Mutex::new(manager));
     let cosmic = cosmic_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref());
-    let sway_connection_ref = if cosmic {
-        None
+    let (backend, sway_connection_ref) = if cosmic {
+        (select_display_backend(true, false), None)
     } else {
-        connect_sway_backend().await?
+        let connection = connect_sway_backend().await?;
+        (
+            select_display_backend(false, connection.is_some()),
+            connection,
+        )
     };
-    let use_wayland = use_wayland_observer(cosmic);
 
-    let wayland_observer_handle = if use_wayland {
+    let wayland_observer_handle = if backend == DisplayBackend::Wayland {
         let (handle, ready) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
         match wait_for_wayland_readiness(ready, WAYLAND_READINESS_TIMEOUT).await {
             Ok(false) => {
@@ -53,7 +56,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let server = DisplayServer::new(
         Arc::clone(&manager_ref),
-        if use_wayland {
+        if backend == DisplayBackend::Wayland {
             None
         } else {
             sway_connection_ref.clone()
@@ -168,8 +171,19 @@ const WAYLAND_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const WAYLAND_MAX_PENDING_ATTEMPTS: usize = 3;
 const WATCH_RESTART_DELAY: Duration = Duration::from_secs(1);
 
-fn use_wayland_observer(cosmic: bool) -> bool {
-    cosmic
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayBackend {
+    Wayland,
+    Sway,
+    Unsupported,
+}
+
+fn select_display_backend(cosmic: bool, sway_available: bool) -> DisplayBackend {
+    match (cosmic, sway_available) {
+        (true, _) => DisplayBackend::Wayland,
+        (false, true) => DisplayBackend::Sway,
+        (false, false) => DisplayBackend::Unsupported,
+    }
 }
 
 fn cosmic_desktop(value: Option<&str>) -> bool {
@@ -180,7 +194,6 @@ fn cosmic_desktop(value: Option<&str>) -> bool {
 }
 
 async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box<dyn Error>> {
-    let cosmic = cosmic_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref());
     let mut last_error = None;
 
     for attempt in 1..=SWAY_CONNECT_ATTEMPTS {
@@ -203,14 +216,7 @@ async fn connect_sway_backend() -> Result<Option<Arc<Mutex<SwayConection>>>, Box
         "Sway IPC backend unavailable after {SWAY_CONNECT_ATTEMPTS} attempts: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
     );
-    if cosmic {
-        warn!(
-            "{message}; continuing without the Sway backend and switching to Wayland output observation"
-        );
-        Ok(None)
-    } else {
-        Err(message.into())
-    }
+    Err(message.into())
 }
 
 fn start_wayland_state_observer(
@@ -622,18 +628,26 @@ mod tests {
     }
 
     #[test]
-    fn cosmic_prefers_wayland_even_when_sway_is_available() {
-        assert!(use_wayland_observer(true));
+    fn cosmic_with_sway_selects_wayland() {
+        assert_eq!(select_display_backend(true, true), DisplayBackend::Wayland);
     }
 
     #[test]
-    fn cosmic_prefers_wayland_without_sway() {
-        assert!(use_wayland_observer(true));
+    fn cosmic_without_sway_selects_wayland() {
+        assert_eq!(select_display_backend(true, false), DisplayBackend::Wayland);
     }
 
     #[test]
-    fn gnome_without_sway_does_not_select_wayland() {
-        assert!(!use_wayland_observer(false));
+    fn gnome_with_sway_selects_sway() {
+        assert_eq!(select_display_backend(false, true), DisplayBackend::Sway);
+    }
+
+    #[test]
+    fn gnome_without_sway_is_unsupported() {
+        assert_eq!(
+            select_display_backend(false, false),
+            DisplayBackend::Unsupported
+        );
     }
 
     #[test]
