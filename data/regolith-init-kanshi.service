@@ -2,14 +2,15 @@
 Description=Start Kanshi for Regolith
 PartOf=graphical-session.target
 PartOf=regolith-gnome.target
+PartOf=regolith-cosmic.target
 StartLimitIntervalSec=10
 StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecCondition=/bin/sh -c 'desktop=$(printf %s "${XDG_CURRENT_DESKTOP:-}" | tr "[:lower:]" "[:upper:]"); case ":$desktop:" in *:COSMIC:*) exit 1;; *:GNOME:*) exit 0;; *) exit 1;; esac'
+ExecCondition=/bin/sh -c 'desktop=$(printf %s "${XDG_CURRENT_DESKTOP:-}" | tr "[:lower:]" "[:upper:]"); case ":$desktop:" in *:COSMIC:*|*:GNOME:*) exit 0;; *) exit 1;; esac'
 ExecStart=/usr/bin/kanshi -c %h/.config/regolith3/kanshi/config
 Restart=on-failure
 
 [Install]
-WantedBy=regolith-gnome.target
+WantedBy=regolith-gnome.target regolith-cosmic.target
