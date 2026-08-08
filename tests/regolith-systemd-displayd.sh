@@ -69,24 +69,7 @@ check_common_metadata "$KANSHI_SERVICE"
 has_line "$KANSHI_SERVICE" "PartOf=regolith-gnome.target" || fail "kanshi target ownership is missing"
 has_line "$KANSHI_SERVICE" "PartOf=regolith-cosmic.target" || fail "kanshi COSMIC target ownership is missing"
 has_line "$KANSHI_SERVICE" "WantedBy=regolith-gnome.target regolith-cosmic.target" || fail "kanshi target install wiring is missing"
-KANSHI_CONDITION="/bin/sh -c 'desktop=\$(printf %s \"\${XDG_CURRENT_DESKTOP:-}\" | tr \"[:lower:]\" \"[:upper:]\"); case \":\$desktop:\" in *:COSMIC:*|*:GNOME:*) exit 0;; *) exit 1;; esac'"
-section_has_setting "$KANSHI_SERVICE" Service ExecCondition "$KANSHI_CONDITION" || fail "kanshi must allow GNOME and COSMIC"
-run_condition() {
-    local condition_body="${KANSHI_CONDITION#*/bin/sh -c '}"
-    condition_body="${condition_body%'}"
-    XDG_CURRENT_DESKTOP="$1" /bin/sh -c "$condition_body"
-}
-assert_condition_status() {
-    local desktop="$1" expected="$2" actual
-    if run_condition "$desktop"; then
-        actual=0
-    else
-        actual=$?
-    fi
-    [ "$actual" -eq "$expected" ] || fail "kanshi condition for $desktop returned $actual, expected $expected"
-}
-assert_condition_status GNOME 0
-assert_condition_status COSMIC 0
-assert_condition_status COSMIC:GNOME 0
-assert_condition_status KDE 1
+if section_has_key "$KANSHI_SERVICE" Service ExecCondition; then
+    fail "kanshi must not gate startup on session environment"
+fi
 echo "displayd systemd metadata: PASS"
