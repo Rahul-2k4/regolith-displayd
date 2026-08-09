@@ -17,7 +17,7 @@ grep -Fx 'regolith-displayd (0.3.4-1) jammy; urgency=medium' "$changelog" >/dev/
 
 # The Rust binary has no usable debug sections; do not emit an empty dbgsym.
 grep -Fx 'override_dh_strip:' "$rules" >/dev/null
-grep -Fx '\tdh_strip --no-automatic-dbgsym' "$rules" >/dev/null
+grep -Fx "$(printf '\tdh_strip --no-automatic-dbgsym')" "$rules" >/dev/null
 
 awk '
     /^Description: / { in_description = 1; next }
