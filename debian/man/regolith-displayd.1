@@ -1,0 +1,17 @@
+.TH REGOLITH-DISPLAYD 1 "2026-08-09" "regolith-displayd 0.3.4" "User Commands"
+.SH NAME
+regolith-displayd \- display settings daemon for Regolith
+.SH SYNOPSIS
+.B regolith-displayd
+.SH DESCRIPTION
+.B regolith-displayd
+provides D-Bus bindings for display configuration in the Regolith desktop.
+It synchronizes display settings with the active Sway compositor and stores
+display profiles through the configured
+.B kanshi
+integration.
+.PP
+The daemon is normally started by the packaged user service.  It does not
+normally require command-line arguments.
+.SH SEE ALSO
+.BR kanshi (1)
