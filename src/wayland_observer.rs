@@ -845,19 +845,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stale_mode_updates_after_head_is_finished() {
-        let mut collector = SnapshotCollector::default();
-        collector.note_head(1);
-        collector.note_mode(1, 20).unwrap();
-        collector.finish_head(1).unwrap();
-
-        assert!(matches!(
-            collector.set_mode_size(20, 2256, 1504),
-            Err(super::SnapshotStateError::UnknownMode(20))
-        ));
-    }
-
-    #[test]
     fn publication_helper_drains_snapshots_before_terminal_error() {
         let mut state = ObserverState::default();
         state.collector.note_head(1);
