@@ -806,6 +806,58 @@ mod tests {
     }
 
     #[test]
+    fn drops_finished_head_from_next_done_snapshot() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(1);
+        collector.set_head_name(1, "eDP-1".to_string()).unwrap();
+        collector.note_head(2);
+        collector.set_head_name(2, "HDMI-A-1".to_string()).unwrap();
+
+        collector.publish_done(1).unwrap();
+        collector.finish_head(2).unwrap();
+        collector.publish_done(2).unwrap();
+
+        let first = collector.take_publication().unwrap();
+        let second = collector.take_publication().unwrap();
+
+        assert_eq!(first.heads.len(), 2);
+        assert_eq!(second.serial, 2);
+        assert_eq!(second.heads.len(), 1);
+        assert_eq!(second.heads[0].name, "eDP-1");
+    }
+
+    #[test]
+    fn finishing_current_mode_clears_mode_state_from_next_snapshot() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(1);
+        collector.set_head_name(1, "eDP-1".to_string()).unwrap();
+        collector.set_head_enabled(1, true).unwrap();
+        collector.note_mode(1, 20).unwrap();
+        collector.set_mode_size(20, 2256, 1504).unwrap();
+        collector.set_head_current_mode(1, 20).unwrap();
+
+        collector.finish_mode(20).unwrap();
+        collector.publish_done(3).unwrap();
+
+        let head = &collector.take_publication().unwrap().heads[0];
+        assert_eq!(head.current_mode, None);
+        assert!(head.modes.is_empty());
+    }
+
+    #[test]
+    fn rejects_stale_mode_updates_after_head_is_finished() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(1);
+        collector.note_mode(1, 20).unwrap();
+        collector.finish_head(1).unwrap();
+
+        assert!(matches!(
+            collector.set_mode_size(20, 2256, 1504),
+            Err(super::SnapshotStateError::UnknownMode(20))
+        ));
+    }
+
+    #[test]
     fn publication_helper_drains_snapshots_before_terminal_error() {
         let mut state = ObserverState::default();
         state.collector.note_head(1);
