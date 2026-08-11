@@ -79,6 +79,27 @@ impl Modes {
         })
     }
 
+    pub fn from_snapshot_with_current(
+        mode_info: &OutputModeSnapshot,
+        current: bool,
+    ) -> Option<Modes> {
+        let width = mode_info.width;
+        let height = mode_info.height;
+        let refresh_rate = (mode_info.refresh_mhz? as f64) / 1000f64;
+        Some(Modes {
+            id: Self::mode_id(width, height, refresh_rate),
+            width,
+            height,
+            refresh_rate,
+            preferred_scale: 1f64,
+            supported_scales: Self::supported_scales(width, height),
+            properties: ModeProperties {
+                current: Some(current),
+                preferred: Some(mode_info.preferred),
+                interlaced: Some(false),
+            },
+        })
+    }
     pub fn get_modestr(&self) -> &str {
         &self.id
     }

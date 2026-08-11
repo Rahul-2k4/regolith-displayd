@@ -1056,6 +1056,62 @@ mod tests {
         assert_eq!(manager.logical_monitors[0].get_dpy_name(), "HDMI-A-1");
     }
 
+    #[test]
+    fn wayland_current_mode_change_makes_profile_dirty_without_identity_change() {
+        let before = snapshot_head(
+            "Virtual-1",
+            true,
+            Some((0, 0)),
+            Some(0),
+            Some(1.0),
+            1280,
+            800,
+            Some(60_004),
+        );
+        let mut after = before.clone();
+        after.current_mode = Some(OutputModeSnapshot {
+            width: 1024,
+            height: 768,
+            refresh_mhz: Some(60_004),
+            preferred: false,
+            current: true,
+        });
+        after.modes = vec![
+            OutputModeSnapshot {
+                width: 1280,
+                height: 800,
+                refresh_mhz: Some(60_004),
+                preferred: true,
+                current: true,
+            },
+            OutputModeSnapshot {
+                width: 1024,
+                height: 768,
+                refresh_mhz: Some(60_004),
+                preferred: false,
+                current: false,
+            },
+        ];
+
+        let before_manager = DisplayManager {
+            serial: 1,
+            monitors: vec![Monitor::from_snapshot(&before)],
+            logical_monitors: vec![LogicalMonitor::from_snapshot(&before).unwrap()],
+            properties: DisplayManagerProperties::new(),
+        };
+        let after_manager = DisplayManager {
+            serial: 2,
+            monitors: vec![Monitor::from_snapshot(&after)],
+            logical_monitors: vec![LogicalMonitor::from_snapshot(&after).unwrap()],
+            properties: DisplayManagerProperties::new(),
+        };
+
+        assert_ne!(
+            kanshi_profile_text(&before_manager.monitors, &before_manager.logical_monitors),
+            kanshi_profile_text(&after_manager.monitors, &after_manager.logical_monitors)
+        );
+    }
+
     fn snapshot_head(
         name: &str,
         enabled: bool,

@@ -99,7 +99,18 @@ impl Monitor {
     }
 
     pub fn from_snapshot(head: &OutputHeadSnapshot) -> Monitor {
-        let modes = head.modes.iter().filter_map(Modes::from_snapshot).collect();
+        let modes = head
+            .modes
+            .iter()
+            .filter_map(|mode| {
+                let current = head.current_mode.as_ref().map_or(mode.current, |selected| {
+                    mode.width == selected.width
+                        && mode.height == selected.height
+                        && mode.refresh_mhz == selected.refresh_mhz
+                });
+                Modes::from_snapshot_with_current(mode, current)
+            })
+            .collect();
 
         Monitor {
             // The wlroots output-management snapshot exposes the connector name and
