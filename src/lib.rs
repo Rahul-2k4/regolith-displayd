@@ -1511,9 +1511,7 @@ mod tests {
         };
 
         assert!(manager.replace_from_wayland_snapshot(&initial).unwrap());
-        assert!(manager
-            .replace_from_wayland_snapshot(&replacement)
-            .unwrap());
+        assert!(manager.replace_from_wayland_snapshot(&replacement).unwrap());
 
         assert_eq!(manager.serial, 11);
         assert_eq!(
