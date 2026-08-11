@@ -1,6 +1,6 @@
 [Unit]
 Description=Start Regolith Display Daemon
-PartOf=graphical-session.target
+PartOf=regolith-gnome.target regolith-cosmic.target
 
 StartLimitIntervalSec=30
 StartLimitBurst=5
