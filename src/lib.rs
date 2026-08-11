@@ -1478,6 +1478,63 @@ mod tests {
     }
 
     #[test]
+    fn replaces_multi_output_state_when_a_head_is_removed() {
+        let mut manager = build_manager(Vec::new(), Vec::new());
+        let initial = OutputSnapshot {
+            serial: 10,
+            heads: vec![
+                snapshot_head(
+                    "DP-1",
+                    true,
+                    Some((0, 0)),
+                    Some(0),
+                    Some(1.0),
+                    1920,
+                    1080,
+                    Some(60_000),
+                ),
+                snapshot_head(
+                    "eDP-1",
+                    true,
+                    Some((1920, 0)),
+                    Some(0),
+                    Some(1.0),
+                    2256,
+                    1504,
+                    Some(60_000),
+                ),
+            ],
+        };
+        let replacement = OutputSnapshot {
+            serial: 11,
+            heads: vec![initial.heads[0].clone()],
+        };
+
+        assert!(manager.replace_from_wayland_snapshot(&initial).unwrap());
+        assert!(manager
+            .replace_from_wayland_snapshot(&replacement)
+            .unwrap());
+
+        assert_eq!(manager.serial, 11);
+        assert_eq!(
+            manager
+                .monitors
+                .iter()
+                .map(|monitor| monitor.get_dpy_name())
+                .collect::<Vec<_>>(),
+            vec!["DP-1".to_string()]
+        );
+        assert_eq!(
+            manager
+                .logical_monitors
+                .iter()
+                .map(|monitor| monitor.get_dpy_name())
+                .collect::<Vec<_>>(),
+            vec!["DP-1".to_string()]
+        );
+    }
+
+    #[test]
     fn unknown_wayland_refresh_keeps_current_mode_unknown_and_omits_kanshi_mode_line() {
         let mut manager = build_manager(Vec::new(), Vec::new());
         let snapshot = OutputSnapshot {
