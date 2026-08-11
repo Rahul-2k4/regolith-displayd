@@ -26,7 +26,7 @@ check_common_metadata() {
 }
 check_common_metadata "$DISPLAYD_SERVICE"
 if grep -Fq "PartOf=graphical-session.target" "$DISPLAYD_SERVICE"; then fail "displayd must not follow generic graphical-session.target teardown"; fi
-if grep -Eq "^PartOf=.*regolith-(gnome|cosmic)\\.target" "$DISPLAYD_SERVICE"; then fail "displayd has mutually exclusive Regolith target ownership"; fi
+has_line "$DISPLAYD_SERVICE" "PartOf=regolith-gnome.target regolith-cosmic.target" || fail "displayd DE target ownership is missing"
 has_line "$DISPLAYD_SERVICE" "WantedBy=regolith-gnome.target regolith-cosmic.target" || fail "displayd target install wiring is missing"
 if grep -Fq "Requires=regolith-init-kanshi.service" "$DISPLAYD_SERVICE"; then fail "displayd still requires kanshi"; fi
 if grep -Fq "Before=regolith-init-kanshi.service" "$DISPLAYD_SERVICE"; then fail "displayd still orders before kanshi"; fi
