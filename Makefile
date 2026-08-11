@@ -1,6 +1,13 @@
 VENDOR ?= 1
 CARGO_VENDOR_FLAGS ?=
 
+ifeq ($(strip $(CARGO_VENDOR_FLAGS)),)
+CARGO_VENDOR_VERSION := $(shell cargo --version 2>/dev/null)
+ifneq (,$(findstring nightly,$(CARGO_VENDOR_VERSION)))
+CARGO_VENDOR_FLAGS := -Znext-lockfile-bump
+endif
+endif
+
 .PHONY: build clean distclean vendor extract-vendor
 
 build: extract-vendor
