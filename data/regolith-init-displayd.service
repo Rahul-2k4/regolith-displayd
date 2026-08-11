@@ -1,6 +1,5 @@
 [Unit]
 Description=Start Regolith Display Daemon
-PartOf=graphical-session.target
 
 StartLimitIntervalSec=30
 StartLimitBurst=5

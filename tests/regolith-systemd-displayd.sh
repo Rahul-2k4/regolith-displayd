@@ -25,7 +25,7 @@ check_common_metadata() {
     if section_has_key "$service" Service StartLimitIntervalSec; then fail "StartLimitIntervalSec remains in [Service] in $service"; fi
 }
 check_common_metadata "$DISPLAYD_SERVICE"
-has_line "$DISPLAYD_SERVICE" "PartOf=graphical-session.target" || fail "displayd graphical-session ownership is missing"
+if grep -Fq "PartOf=graphical-session.target" "$DISPLAYD_SERVICE"; then fail "displayd must not follow generic graphical-session.target teardown"; fi
 if grep -Eq "^PartOf=.*regolith-(gnome|cosmic)\\.target" "$DISPLAYD_SERVICE"; then fail "displayd has mutually exclusive Regolith target ownership"; fi
 has_line "$DISPLAYD_SERVICE" "WantedBy=regolith-gnome.target regolith-cosmic.target" || fail "displayd target install wiring is missing"
 if grep -Fq "Requires=regolith-init-kanshi.service" "$DISPLAYD_SERVICE"; then fail "displayd still requires kanshi"; fi
