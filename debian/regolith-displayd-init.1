@@ -1,0 +1,19 @@
+.TH REGOLITH-DISPLAYD-INIT 1 "August 2026" "regolith-displayd 0.3.4" "User Commands"
+.SH NAME
+regolith-displayd-init \- initialise the Regolith Kanshi configuration
+.SH SYNOPSIS
+.B regolith-displayd-init
+.SH DESCRIPTION
+.B regolith-displayd-init
+creates the Regolith Kanshi configuration directory and an include file for
+profile snippets when they do not already exist.  If the profile directory is
+empty, it creates a harmless empty profile so Kanshi can start cleanly.
+.SH ENVIRONMENT
+.TP
+.B REGOLITH_KANSHI_DIR
+Use this directory instead of
+.IR ~/.config/regolith3/kanshi .
+.SH SEE ALSO
+.BR regolith-displayd (1)
+.SH AUTHOR
+The regolith-displayd contributors.

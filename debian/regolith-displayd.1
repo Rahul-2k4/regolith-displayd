@@ -1,0 +1,18 @@
+.TH REGOLITH-DISPLAYD 1 "August 2026" "regolith-displayd 0.3.4" "User Commands"
+.SH NAME
+regolith-displayd \- synchronise display state for the Regolith desktop
+.SH SYNOPSIS
+.B regolith-displayd
+.SH DESCRIPTION
+.B regolith-displayd
+observes the desktop display state and exposes the display service used by
+Regolith components.  It is normally started by the user systemd unit
+.BR regolith-init-displayd.service (5).
+.SH FILES
+.TP
+.I /usr/lib/systemd/user/regolith-init-displayd.service
+User service that prepares the display configuration and starts the daemon.
+.SH SEE ALSO
+.BR regolith-displayd-init (1)
+.SH AUTHOR
+The regolith-displayd contributors.
