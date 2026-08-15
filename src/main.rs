@@ -620,10 +620,10 @@ mod tests {
     }
 
     #[test]
-    fn initial_wayland_snapshot_publishes_without_persisting_profile() {
-        assert!(!wayland_snapshot_needs_persistence(true, true));
-        assert!(wayland_snapshot_needs_persistence(true, false));
-        assert!(!wayland_snapshot_needs_persistence(false, false));
+    fn wayland_snapshot_persistence_requires_prior_snapshot_and_change() {
+        assert!(!wayland_snapshot_needs_persistence(true, false));
+        assert!(wayland_snapshot_needs_persistence(true, true));
+        assert!(!wayland_snapshot_needs_persistence(false, true));
     }
 
     #[test]
