@@ -67,8 +67,9 @@ if grep -Fq "Requires=regolith-init-kanshi.service" "$DISPLAYD_SERVICE"; then fa
 if grep -Fq "Before=regolith-init-kanshi.service" "$DISPLAYD_SERVICE"; then fail "displayd still orders before kanshi"; fi
 check_common_metadata "$KANSHI_SERVICE"
 has_line "$KANSHI_SERVICE" "PartOf=regolith-gnome.target" || fail "kanshi target ownership is missing"
-has_line "$KANSHI_SERVICE" "PartOf=regolith-cosmic.target" || fail "kanshi COSMIC target ownership is missing"
-has_line "$KANSHI_SERVICE" "WantedBy=regolith-gnome.target regolith-cosmic.target" || fail "kanshi target install wiring is missing"
+if grep -Fq "PartOf=regolith-cosmic.target" "$KANSHI_SERVICE"; then fail "kanshi must remain GNOME-only"; fi
+has_line "$KANSHI_SERVICE" "WantedBy=regolith-gnome.target" || fail "kanshi GNOME target install wiring is missing"
+if grep -Fq "WantedBy=regolith-gnome.target regolith-cosmic.target" "$KANSHI_SERVICE"; then fail "kanshi must not install into the COSMIC target"; fi
 if section_has_key "$KANSHI_SERVICE" Service ExecCondition; then
     fail "kanshi must not gate startup on session environment"
 fi

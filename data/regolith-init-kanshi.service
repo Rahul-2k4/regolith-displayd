@@ -2,7 +2,7 @@
 Description=Start Kanshi for Regolith
 PartOf=graphical-session.target
 PartOf=regolith-gnome.target
-PartOf=regolith-cosmic.target
+# COSMIC display persistence is owned by regolith-displayd's Wayland observer.
 StartLimitIntervalSec=10
 StartLimitBurst=5
 
@@ -12,4 +12,4 @@ ExecStart=/usr/bin/kanshi -c %h/.config/regolith3/kanshi/config
 Restart=on-failure
 
 [Install]
-WantedBy=regolith-gnome.target regolith-cosmic.target
+WantedBy=regolith-gnome.target
