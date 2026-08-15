@@ -113,9 +113,9 @@ impl Monitor {
             .collect();
 
         Monitor {
-            // The wlroots output-management snapshot exposes the connector name and
-            // optional human-readable description, but not vendor/model/serial.
-            description: snapshot_identity(&head.name),
+            // The wlroots output-management snapshot exposes a human-readable
+            // description when available, with the connector name as fallback.
+            description: snapshot_identity(&head.name, head.description.as_deref()),
             modes,
             properties: MonitorProperties::from_snapshot(head),
         }
@@ -354,7 +354,7 @@ impl LogicalMonitor {
             scale,
             transform,
             primary: false,
-            monitors: vec![snapshot_identity(&head.name)],
+            monitors: vec![snapshot_identity(&head.name, head.description.as_deref())],
             properties: LogicalMonitorProperties {
                 dummy: None,
                 dummy2: None,
@@ -372,9 +372,9 @@ impl LogicalMonitor {
     }
 }
 
-fn snapshot_identity(name: &str) -> (String, String, String, String) {
+fn snapshot_identity(name: &str, description: Option<&str>) -> (String, String, String, String) {
     (
-        name.to_string(),
+        description.unwrap_or(name).to_string(),
         String::new(),
         String::new(),
         String::new(),
@@ -616,13 +616,13 @@ mod tests {
         assert_eq!(
             monitor.description,
             (
-                "DP-1".to_string(),
+                "Desk display".to_string(),
                 String::new(),
                 String::new(),
                 String::new()
             )
         );
-        assert_eq!(monitor.get_dpy_name(), "DP-1");
+        assert_eq!(monitor.get_dpy_name(), "Desk display");
         assert_eq!(monitor.properties.name.as_deref(), Some("Desk display"));
     }
 
@@ -641,19 +641,31 @@ mod tests {
     fn builds_logical_monitor_from_wayland_snapshot_with_fractional_scale_and_position() {
         let logical = LogicalMonitor::from_snapshot(&wayland_head("HDMI-A-1")).unwrap();
 
-        assert_eq!(logical.get_dpy_name(), "HDMI-A-1");
+        assert_eq!(logical.get_dpy_name(), "Desk display");
         assert_eq!(logical.scale, 1.25);
         assert_eq!((logical.x_pos, logical.y_pos), (320, 180));
         assert_eq!(logical.transform, 3);
         assert_eq!(
             logical.monitors,
             vec![(
-                "HDMI-A-1".to_string(),
+                "Desk display".to_string(),
                 String::new(),
                 String::new(),
                 String::new()
             )]
         );
+    }
+
+    #[test]
+    fn falls_back_to_connector_name_without_wayland_description() {
+        let mut head = wayland_head("HDMI-A-2");
+        head.description = None;
+
+        let monitor = Monitor::from_snapshot(&head);
+        let logical = LogicalMonitor::from_snapshot(&head).unwrap();
+
+        assert_eq!(monitor.get_dpy_name(), "HDMI-A-2");
+        assert_eq!(logical.get_dpy_name(), "HDMI-A-2");
     }
 
     #[test]
