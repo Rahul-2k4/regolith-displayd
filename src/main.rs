@@ -241,6 +241,7 @@ fn consume_wayland_observer(
     let mut pending_manager = None;
     let mut pending_stage = None;
     let mut pending_attempts = 0;
+    let mut initial_snapshot = true;
     // COSMIC snapshots use the same persistence and signal path as Sway observations.
     loop {
         let result = match pending_stage {
@@ -290,11 +291,14 @@ fn consume_wayland_observer(
                 ));
                 match install {
                     Ok(state_changed) => {
+                        let persist_snapshot =
+                            wayland_snapshot_needs_persistence(state_changed, !initial_snapshot);
+                        initial_snapshot = false;
                         let result = process_wayland_candidate(
                             &runtime,
                             &manager_ref,
                             candidate_manager,
-                            state_changed,
+                            persist_snapshot,
                             &mut pending_stage,
                             &mut pending_manager,
                             &mut ready_sender,
@@ -326,6 +330,10 @@ fn consume_wayland_observer(
             }
         }
     }
+}
+
+fn wayland_snapshot_needs_persistence(state_changed: bool, has_previous_snapshot: bool) -> bool {
+    state_changed && has_previous_snapshot
 }
 
 fn notify_wayland_readiness(
@@ -609,6 +617,13 @@ mod tests {
             result,
             Err(error) if error.contains("after 3 attempts") && error.contains("write failed")
         ));
+    }
+
+    #[test]
+    fn initial_wayland_snapshot_publishes_without_persisting_profile() {
+        assert!(!wayland_snapshot_needs_persistence(true, true));
+        assert!(wayland_snapshot_needs_persistence(true, false));
+        assert!(!wayland_snapshot_needs_persistence(false, false));
     }
 
     #[test]
