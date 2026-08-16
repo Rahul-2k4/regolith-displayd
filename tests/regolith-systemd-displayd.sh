@@ -72,4 +72,10 @@ has_line "$KANSHI_SERVICE" "WantedBy=regolith-gnome.target regolith-cosmic.targe
 if section_has_key "$KANSHI_SERVICE" Service ExecCondition; then
     fail "kanshi must not gate startup on session environment"
 fi
+if grep -Fq "killall" "$ROOT_DIR/src/lib.rs"; then
+    fail "displayd must not manage kanshi processes directly"
+fi
+if ! grep -Fq 'Command::new("systemctl")' "$ROOT_DIR/src/lib.rs" || ! grep -Fq 'regolith-init-kanshi.service' "$ROOT_DIR/src/lib.rs"; then
+    fail "displayd must restart the systemd-owned kanshi service"
+fi
 echo "displayd systemd metadata: PASS"

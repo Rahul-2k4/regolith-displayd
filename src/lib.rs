@@ -550,8 +550,9 @@ pub async fn reload_kanshi() -> zbus::Result<()> {
         .into_os_string()
         .into_string()
         .unwrap_or(default_config_path);
-    Command::new("killall").arg("kanshi").spawn()?;
-    Command::new("kanshi").arg("-c").arg(&config_path).spawn()?;
+    Command::new("systemctl")
+        .args(["--user", "restart", "regolith-init-kanshi.service"])
+        .spawn()?;
     Ok(())
 }
 
