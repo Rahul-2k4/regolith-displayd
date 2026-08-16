@@ -75,6 +75,12 @@ pub fn wayland_stage_after_reload() -> WaylandSideEffectStage {
     WaylandSideEffectStage::Signal
 }
 
+pub fn should_reload_kanshi(xdg_current_desktop: Option<&str>) -> bool {
+    !xdg_current_desktop
+        .map(|desktop| desktop.to_ascii_lowercase().contains("cosmic"))
+        .unwrap_or(false)
+}
+
 /// DBus Interface for providing bindings
 pub struct DisplayServer {
     manager: Arc<Mutex<DisplayManager>>,
@@ -544,6 +550,11 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
 }
 
 pub async fn reload_kanshi() -> zbus::Result<()> {
+    if !should_reload_kanshi(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref()) {
+        info!("Skipping Kanshi reload for COSMIC desktop");
+        return Ok(());
+    }
+
     let KanshiPaths { config, .. } = get_kanshi_paths().await?;
     let default_config_path = String::from("~/.config/regolith3/kanshi/config");
     let config_path: String = config
@@ -800,6 +811,18 @@ mod tests {
     }
 
     #[test]
+    fn cosmic_desktop_skips_kanshi_reload() {
+        assert!(!should_reload_kanshi(Some("COSMIC")));
+        assert!(!should_reload_kanshi(Some("cosmic:GNOME")));
+    }
+
+    #[test]
+    fn non_cosmic_desktops_preserve_kanshi_reload() {
+        assert!(should_reload_kanshi(Some("GNOME")));
+        assert!(should_reload_kanshi(Some("sway")));
+        assert!(should_reload_kanshi(None));
+    }
+
     fn commits_refreshed_monitor_info_before_signal_state_is_observable() {
         let previous_monitor = Monitor::test_new(
             "eDP-1",
