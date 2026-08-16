@@ -544,14 +544,14 @@ pub async fn get_kanshi_paths() -> zbus::Result<KanshiPaths> {
 }
 
 pub async fn reload_kanshi() -> zbus::Result<()> {
-    let KanshiPaths { config, .. } = get_kanshi_paths().await?;
-    let default_config_path = String::from("~/.config/regolith3/kanshi/config");
-    let config_path: String = config
-        .into_os_string()
-        .into_string()
-        .unwrap_or(default_config_path);
     Command::new("systemctl")
-        .args(["--user", "restart", "regolith-init-kanshi.service"])
+        .args([
+            "--user",
+            "kill",
+            "-s",
+            "HUP",
+            "regolith-init-kanshi.service",
+        ])
         .spawn()?;
     Ok(())
 }

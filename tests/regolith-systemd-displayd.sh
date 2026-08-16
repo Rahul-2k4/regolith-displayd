@@ -75,7 +75,10 @@ fi
 if grep -Fq "killall" "$ROOT_DIR/src/lib.rs"; then
     fail "displayd must not manage kanshi processes directly"
 fi
-if ! grep -Fq 'Command::new("systemctl")' "$ROOT_DIR/src/lib.rs" || ! grep -Fq 'regolith-init-kanshi.service' "$ROOT_DIR/src/lib.rs"; then
-    fail "displayd must restart the systemd-owned kanshi service"
+if ! grep -Fq 'Command::new(' src/lib.rs || ! grep -Fq 'systemctl' src/lib.rs || ! grep -Fq -- '--user' src/lib.rs || ! grep -Fq 'kill' src/lib.rs || ! grep -Fq -- '-s' src/lib.rs || ! grep -Fq 'HUP' src/lib.rs || ! grep -Fq 'regolith-init-kanshi.service' src/lib.rs; then
+    fail "displayd must signal the systemd-owned kanshi service with SIGHUP"
+fi
+if grep -Fq 'restart' "$ROOT_DIR/src/lib.rs"; then
+    fail "displayd must not restart the systemd-owned kanshi service"
 fi
 echo "displayd systemd metadata: PASS"
