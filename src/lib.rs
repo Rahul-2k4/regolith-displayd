@@ -75,6 +75,13 @@ pub fn wayland_stage_after_reload() -> WaylandSideEffectStage {
     WaylandSideEffectStage::Signal
 }
 
+/// COSMIC currently has the read side of wlr-output-management only. Keep the
+/// apply boundary explicit so a stored profile is never mistaken for a live
+/// compositor reconfiguration.
+pub fn cosmic_profile_apply_status() -> Result<(), &'static str> {
+    Err("COSMIC profile apply is unavailable: the Wayland observer does not retain output-manager, head, or mode handles needed for create_configuration")
+}
+
 pub fn should_reload_kanshi(xdg_current_desktop: Option<&str>) -> bool {
     !xdg_current_desktop
         .map(|desktop| desktop.to_ascii_lowercase().contains("cosmic"))
@@ -745,8 +752,16 @@ async fn write_kanshi_profile_if_changed(
     profile_text: &str,
 ) -> Result<bool, Box<dyn Error>> {
     let kanshi_paths = get_kanshi_paths().await?;
-    fs::create_dir_all(&kanshi_paths.profiles)?;
-    let profile_path = kanshi_paths.profiles.join(profile_name);
+    write_profile_if_changed(&kanshi_paths.profiles, profile_name, profile_text)
+}
+
+fn write_profile_if_changed(
+    profile_dir: &std::path::Path,
+    profile_name: &str,
+    profile_text: &str,
+) -> Result<bool, Box<dyn Error>> {
+    fs::create_dir_all(profile_dir)?;
+    let profile_path = profile_dir.join(profile_name);
 
     if let Ok(existing_profile) = fs::read_to_string(&profile_path) {
         if existing_profile == profile_text {
@@ -821,6 +836,33 @@ mod tests {
         assert!(should_reload_kanshi(Some("GNOME")));
         assert!(should_reload_kanshi(Some("sway")));
         assert!(should_reload_kanshi(None));
+    }
+
+    #[test]
+    fn cosmic_profile_apply_reports_missing_wayland_configuration_handles() {
+        assert_eq!(
+            cosmic_profile_apply_status(),
+            Err("COSMIC profile apply is unavailable: the Wayland observer does not retain output-manager, head, or mode handles needed for create_configuration")
+        );
+    }
+
+    #[test]
+    fn profile_storage_writes_new_content_and_skips_identical_content() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "regolith-displayd-profile-test-{}",
+            std::process::id()
+        ));
+        let profile_name = "eDP-1";
+        let profile_text = "profile {\n}\n";
+
+        assert!(write_profile_if_changed(&profile_dir, profile_name, profile_text).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(profile_dir.join(profile_name)).unwrap(),
+            profile_text
+        );
+        assert!(!write_profile_if_changed(&profile_dir, profile_name, profile_text).unwrap());
+        assert!(write_profile_if_changed(&profile_dir, profile_name, "profile { }\n").unwrap());
+        let _ = std::fs::remove_dir_all(profile_dir);
     }
 
     fn commits_refreshed_monitor_info_before_signal_state_is_observable() {
