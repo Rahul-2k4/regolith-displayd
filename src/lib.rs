@@ -800,6 +800,19 @@ mod tests {
     }
 
     #[test]
+    fn cosmic_desktops_skip_kanshi_reload() {
+        assert!(!should_reload_kanshi(Some("COSMIC")));
+        assert!(!should_reload_kanshi(Some("cosmic:GNOME")));
+    }
+
+    #[test]
+    fn non_cosmic_desktops_keep_kanshi_reload() {
+        assert!(should_reload_kanshi(Some("GNOME")));
+        assert!(should_reload_kanshi(Some("sway")));
+        assert!(should_reload_kanshi(None));
+    }
+
+    #[test]
     fn commits_refreshed_monitor_info_before_signal_state_is_observable() {
         let previous_monitor = Monitor::test_new(
             "eDP-1",
