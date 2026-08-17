@@ -159,7 +159,8 @@ impl PartialEq for LogicalMonitor {
             && self.y_pos == other.y_pos
             && self.scale.to_bits() == other.scale.to_bits()
             && self.transform == other.transform
-            && self.monitors.first() == other.monitors.first()
+            && self.monitors.first().map(|monitor| &monitor.0)
+                == other.monitors.first().map(|monitor| &monitor.0)
     }
 }
 
@@ -180,7 +181,7 @@ impl Hash for LogicalMonitor {
         self.x_pos.hash(state);
         self.transform.hash(state);
         self.scale.to_bits().hash(state);
-        self.monitors.first().hash(state);
+        self.monitors.first().map(|monitor| &monitor.0).hash(state);
     }
 }
 

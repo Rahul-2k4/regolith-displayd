@@ -743,3 +743,18 @@ mod tests {
         assert!(!profile.contains("output \"Regolith Panel A1\" disable"));
     }
 }
+#[test]
+fn logical_monitor_identity_ignores_non_identity_metadata() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let left = LogicalMonitor::test_new("eDP-1", "Vendor-A", 10, 20, 1.25, 0, true);
+    let right = LogicalMonitor::test_new("eDP-1", "Vendor-B", 10, 20, 1.25, 0, true);
+    let mut left_hash = DefaultHasher::new();
+    let mut right_hash = DefaultHasher::new();
+    left.hash(&mut left_hash);
+    right.hash(&mut right_hash);
+
+    assert_eq!(left, right);
+    assert_eq!(left_hash.finish(), right_hash.finish());
+}
