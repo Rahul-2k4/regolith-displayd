@@ -401,6 +401,26 @@ impl LogicalMonitor {
     }
 }
 
+impl MonitorApply {
+    pub(crate) fn output_name_and_mode(&self) -> Option<(&str, &str)> {
+        self.monitors
+            .first()
+            .map(|(name, mode, _)| (name.as_str(), mode.as_str()))
+    }
+
+    pub(crate) fn position(&self) -> (i32, i32) {
+        (self.x_pos, self.y_pos)
+    }
+
+    pub(crate) fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    pub(crate) fn transform(&self) -> u32 {
+        self.transform
+    }
+}
+
 #[cfg(test)]
 impl MonitorApply {
     pub(crate) fn test_new(
