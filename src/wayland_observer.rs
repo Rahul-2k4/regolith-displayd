@@ -17,8 +17,14 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 use wayland_protocols_wlr::output_management::v1::client::{
-    zwlr_output_head_v1, zwlr_output_head_v1::ZwlrOutputHeadV1, zwlr_output_manager_v1,
-    zwlr_output_manager_v1::ZwlrOutputManagerV1, zwlr_output_mode_v1,
+    zwlr_output_configuration_head_v1,
+    zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1,
+    zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
+    zwlr_output_head_v1,
+    zwlr_output_head_v1::ZwlrOutputHeadV1,
+    zwlr_output_manager_v1,
+    zwlr_output_manager_v1::ZwlrOutputManagerV1,
+    zwlr_output_mode_v1,
     zwlr_output_mode_v1::ZwlrOutputModeV1,
 };
 
@@ -226,6 +232,7 @@ struct ObserverState {
     collector: SnapshotCollector,
     handles: OutputManagementHandles,
     _manager: Option<ZwlrOutputManagerV1>,
+    configuration_response: Option<Sender<Result<(), String>>>,
     terminal_error: Option<WaylandObserverError>,
     terminal_reached: bool,
 }
@@ -299,6 +306,37 @@ impl Dispatch<ZwlrOutputManagerV1, ()> for ObserverState {
     event_created_child!(ObserverState, ZwlrOutputManagerV1, [
         zwlr_output_manager_v1::EVT_HEAD_OPCODE => (ZwlrOutputHeadV1, ()),
     ]);
+}
+
+impl Dispatch<ZwlrOutputConfigurationV1, ()> for ObserverState {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrOutputConfigurationV1,
+        event: zwlr_output_configuration_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let Some(result) = configuration_outcome(event) else {
+            return;
+        };
+        proxy.destroy();
+        if let Some(response) = state.configuration_response.take() {
+            let _ = response.send(result);
+        }
+    }
+}
+
+impl Dispatch<ZwlrOutputConfigurationHeadV1, ()> for ObserverState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrOutputConfigurationHeadV1,
+        _event: zwlr_output_configuration_head_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<ZwlrOutputHeadV1, ()> for ObserverState {
@@ -436,6 +474,42 @@ impl OutputManagementHandles {
         self.modes.remove(&mode_id);
     }
 
+    fn build_output_configuration(
+        &self,
+        manager: &ZwlrOutputManagerV1,
+        request: &OutputConfigurationRequest,
+        qh: &QueueHandle<ObserverState>,
+    ) -> Result<ZwlrOutputConfigurationV1, String> {
+        request.validate(self.heads.keys().copied())?;
+        let configuration = manager.create_configuration(request.serial, qh, ());
+        for (head_id, head) in &self.heads {
+            let spec = request
+                .heads
+                .iter()
+                .find(|spec| spec.head_id == *head_id)
+                .unwrap();
+            if spec.enabled {
+                let head_config = configuration.enable_head(head, qh, ());
+                let mode_id = spec
+                    .mode_id
+                    .ok_or_else(|| format!("enabled head {head_id} has no mode"))?;
+                let mode = self
+                    .mode(*head_id, mode_id)
+                    .ok_or_else(|| format!("mode {mode_id} does not belong to head {head_id}"))?;
+                head_config.set_mode(mode);
+                head_config.set_position(spec.position.0, spec.position.1);
+                head_config.set_transform(
+                    wayland_client::protocol::wl_output::Transform::try_from(spec.transform)
+                        .map_err(|_| format!("invalid transform for head {head_id}"))?,
+                );
+                head_config.set_scale(spec.scale);
+            } else {
+                configuration.disable_head(head);
+            }
+        }
+        Ok(configuration)
+    }
+
     /// Returns the retained head proxy for a protocol object ID.
     pub(crate) fn head(&self, head_id: u32) -> Option<&ZwlrOutputHeadV1> {
         self.heads.get(&head_id)
@@ -447,6 +521,65 @@ impl OutputManagementHandles {
             .get(&mode_id)
             .filter(|mode| mode.head_id == head_id)
             .map(|mode| &mode.proxy)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputHeadConfiguration {
+    pub head_id: u32,
+    pub enabled: bool,
+    pub mode_id: Option<u32>,
+    pub position: (i32, i32),
+    pub transform: u32,
+    pub scale: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputConfigurationRequest {
+    pub serial: u32,
+    pub heads: Vec<OutputHeadConfiguration>,
+}
+
+impl OutputConfigurationRequest {
+    fn validate<I>(&self, retained_heads: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let retained = retained_heads
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let requested = self
+            .heads
+            .iter()
+            .map(|head| head.head_id)
+            .collect::<std::collections::HashSet<_>>();
+        if requested.len() != self.heads.len() {
+            return Err("output configuration contains a duplicate head".to_string());
+        }
+        if requested != retained {
+            return Err(
+                "output configuration must configure every retained head exactly once".to_string(),
+            );
+        }
+        if self
+            .heads
+            .iter()
+            .any(|head| !head.scale.is_finite() || head.scale <= 0.0)
+        {
+            return Err("output configuration contains an invalid scale".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn configuration_outcome(
+    event: wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event,
+) -> Option<Result<(), String>> {
+    match event {
+        wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event::Succeeded => Some(Ok(())),
+        wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event::Failed => Some(Err("COSMIC output configuration failed".to_string())),
+        wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event::Cancelled => Some(Err("COSMIC output configuration cancelled".to_string())),
+        _ => None,
     }
 }
 
@@ -767,6 +900,64 @@ fn normalize_scale(scale: f64) -> Result<f64, SnapshotStateError> {
         return Err(SnapshotStateError::InvalidScale(scale));
     }
     Ok(rounded)
+}
+
+#[cfg(test)]
+mod output_configuration_tests {
+    use super::zwlr_output_configuration_v1;
+    use super::{configuration_outcome, OutputConfigurationRequest, OutputHeadConfiguration};
+
+    fn head(head_id: u32) -> OutputHeadConfiguration {
+        OutputHeadConfiguration {
+            head_id,
+            enabled: false,
+            mode_id: None,
+            position: (0, 0),
+            transform: 0,
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn request_rejects_duplicate_or_missing_heads() {
+        let duplicate = OutputConfigurationRequest {
+            serial: 1,
+            heads: vec![head(1), head(1)],
+        };
+        assert!(duplicate.validate([1]).is_err());
+        let incomplete = OutputConfigurationRequest {
+            serial: 1,
+            heads: vec![head(1)],
+        };
+        assert!(incomplete.validate([1, 2]).is_err());
+    }
+
+    #[test]
+    fn request_rejects_invalid_scale() {
+        let mut invalid = head(1);
+        invalid.scale = 0.0;
+        let request = OutputConfigurationRequest {
+            serial: 1,
+            heads: vec![invalid],
+        };
+        assert!(request.validate([1]).is_err());
+    }
+
+    #[test]
+    fn terminal_protocol_events_have_explicit_outcomes() {
+        assert_eq!(
+            configuration_outcome(zwlr_output_configuration_v1::Event::Succeeded),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            configuration_outcome(zwlr_output_configuration_v1::Event::Failed),
+            Some(Err("COSMIC output configuration failed".to_string()))
+        );
+        assert_eq!(
+            configuration_outcome(zwlr_output_configuration_v1::Event::Cancelled),
+            Some(Err("COSMIC output configuration cancelled".to_string()))
+        );
+    }
 }
 
 #[cfg(test)]

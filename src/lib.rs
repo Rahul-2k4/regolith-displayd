@@ -75,11 +75,10 @@ pub fn wayland_stage_after_reload() -> WaylandSideEffectStage {
     WaylandSideEffectStage::Signal
 }
 
-/// COSMIC currently has the read side of wlr-output-management only. Keep the
-/// apply boundary explicit so a stored profile is never mistaken for a live
-/// compositor reconfiguration.
+/// The internal observer-thread builder now owns the protocol apply mechanics.
+/// Keep the D-Bus boundary explicit until it is wired to that same thread.
 pub fn cosmic_profile_apply_status() -> Result<(), &'static str> {
-    Err("COSMIC profile apply is unavailable: the Wayland observer does not retain output-manager, head, or mode handles needed for create_configuration")
+    Err("COSMIC profile apply is unavailable: the DisplayServer D-Bus boundary is not wired to the observer-thread OutputConfigurationRequest")
 }
 
 /// A validated output change that can be handed to a future Wayland apply
@@ -917,7 +916,7 @@ mod tests {
     fn cosmic_profile_apply_reports_missing_wayland_configuration_handles() {
         assert_eq!(
             cosmic_profile_apply_status(),
-            Err("COSMIC profile apply is unavailable: the Wayland observer does not retain output-manager, head, or mode handles needed for create_configuration")
+            Err("COSMIC profile apply is unavailable: the DisplayServer D-Bus boundary is not wired to the observer-thread OutputConfigurationRequest")
         );
     }
 
