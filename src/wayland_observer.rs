@@ -224,6 +224,7 @@ impl WaylandOutputObserver {
 #[derive(Debug, Default)]
 struct ObserverState {
     collector: SnapshotCollector,
+    handles: OutputManagementHandles,
     _manager: Option<ZwlrOutputManagerV1>,
     terminal_error: Option<WaylandObserverError>,
     terminal_reached: bool,
@@ -279,7 +280,9 @@ impl Dispatch<ZwlrOutputManagerV1, ()> for ObserverState {
     ) {
         match event {
             zwlr_output_manager_v1::Event::Head { head } => {
-                state.collector.note_head(head.id().protocol_id());
+                let head_id = head.id().protocol_id();
+                state.handles.retain_head(head);
+                state.collector.note_head(head_id);
             }
             zwlr_output_manager_v1::Event::Done { serial } => {
                 if let Err(error) = state.collector.publish_done(serial) {
@@ -333,9 +336,17 @@ impl Dispatch<ZwlrOutputHeadV1, ()> for ObserverState {
                 state.collector.set_head_scale(head_id, scale)
             }
             zwlr_output_head_v1::Event::Mode { mode } => {
-                state.collector.note_mode(head_id, mode.id().protocol_id())
+                let mode_id = mode.id().protocol_id();
+                state.handles.retain_mode(head_id, mode);
+                state.collector.note_mode(head_id, mode_id)
             }
-            zwlr_output_head_v1::Event::Finished => state.collector.finish_head(head_id),
+            zwlr_output_head_v1::Event::Finished => {
+                let result = state.collector.finish_head(head_id);
+                if result.is_ok() {
+                    state.handles.release_head(head_id);
+                }
+                result
+            }
             _ => Ok(()),
         };
 
@@ -367,13 +378,75 @@ impl Dispatch<ZwlrOutputModeV1, ()> for ObserverState {
                 state.collector.set_mode_refresh(mode_id, refresh)
             }
             zwlr_output_mode_v1::Event::Preferred => state.collector.set_mode_preferred(mode_id),
-            zwlr_output_mode_v1::Event::Finished => state.collector.finish_mode(mode_id),
+            zwlr_output_mode_v1::Event::Finished => {
+                let result = state.collector.finish_mode(mode_id);
+                if result.is_ok() {
+                    state.handles.release_mode(mode_id);
+                }
+                result
+            }
             _ => Ok(()),
         };
 
         if let Err(error) = result {
             state.store_error(error);
         }
+    }
+}
+
+/// Keeps output-management proxies alive for a future configuration transaction.
+///
+/// Protocol object IDs remain valid only for the lifetime of this observer
+/// connection. They are sufficient to associate handles with the immutable
+/// snapshot state collected from the same connection.
+#[derive(Debug, Default)]
+pub(crate) struct OutputManagementHandles {
+    heads: HashMap<u32, ZwlrOutputHeadV1>,
+    modes: HashMap<u32, RetainedMode>,
+}
+
+#[derive(Debug)]
+struct RetainedMode {
+    head_id: u32,
+    proxy: ZwlrOutputModeV1,
+}
+
+#[allow(dead_code)]
+impl OutputManagementHandles {
+    fn retain_head(&mut self, head: ZwlrOutputHeadV1) {
+        self.heads.insert(head.id().protocol_id(), head);
+    }
+
+    fn retain_mode(&mut self, head_id: u32, mode: ZwlrOutputModeV1) {
+        self.modes.insert(
+            mode.id().protocol_id(),
+            RetainedMode {
+                head_id,
+                proxy: mode,
+            },
+        );
+    }
+
+    fn release_head(&mut self, head_id: u32) {
+        self.heads.remove(&head_id);
+        self.modes.retain(|_, mode| mode.head_id != head_id);
+    }
+
+    fn release_mode(&mut self, mode_id: u32) {
+        self.modes.remove(&mode_id);
+    }
+
+    /// Returns the retained head proxy for a protocol object ID.
+    pub(crate) fn head(&self, head_id: u32) -> Option<&ZwlrOutputHeadV1> {
+        self.heads.get(&head_id)
+    }
+
+    /// Returns the retained mode proxy when it belongs to the given head ID.
+    pub(crate) fn mode(&self, head_id: u32, mode_id: u32) -> Option<&ZwlrOutputModeV1> {
+        self.modes
+            .get(&mode_id)
+            .filter(|mode| mode.head_id == head_id)
+            .map(|mode| &mode.proxy)
     }
 }
 
