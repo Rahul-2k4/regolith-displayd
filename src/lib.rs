@@ -82,6 +82,81 @@ pub fn cosmic_profile_apply_status() -> Result<(), &'static str> {
     Err("COSMIC profile apply is unavailable: the Wayland observer does not retain output-manager, head, or mode handles needed for create_configuration")
 }
 
+/// A validated output change that can be handed to a future Wayland apply
+/// implementation. This is planning only; it does not contain protocol
+/// objects and cannot change compositor state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CosmicOutputPlan {
+    pub name: String,
+    pub position: (i32, i32),
+    pub transform: u32,
+    pub scale_milli: u32,
+    pub mode: (i32, i32, Option<i32>),
+}
+
+/// Resolve a stored Mutter-style profile against an observed wlroots snapshot.
+/// The returned plan is the explicit integration boundary for a future
+/// `zwlr_output_manager_v1.create_configuration` implementation.
+pub fn plan_cosmic_profile(
+    snapshot: &OutputSnapshot,
+    logical_monitors: &[MonitorApply],
+) -> Result<Vec<CosmicOutputPlan>, String> {
+    let mut plans = Vec::with_capacity(logical_monitors.len());
+
+    for logical_monitor in logical_monitors {
+        let (name, mode_id) = logical_monitor
+            .output_name_and_mode()
+            .ok_or_else(|| "COSMIC profile output has no physical monitor identity".to_string())?;
+        let head = snapshot
+            .heads
+            .iter()
+            .find(|head| head.name == *name)
+            .ok_or_else(|| format!("COSMIC profile output is absent from snapshot: {name}"))?;
+        if !head.enabled {
+            return Err(format!("COSMIC profile output is disabled: {name}"));
+        }
+        if plans
+            .iter()
+            .any(|plan: &CosmicOutputPlan| plan.name == *name)
+        {
+            return Err(format!("COSMIC profile contains duplicate output: {name}"));
+        }
+
+        let dimensions = parse_mode_dimensions(mode_id)
+            .ok_or_else(|| format!("COSMIC profile mode is malformed for {name}: {mode_id}"))?;
+        let mode = head
+            .modes
+            .iter()
+            .find(|mode| (mode.width, mode.height) == dimensions)
+            .ok_or_else(|| {
+                format!(
+                    "COSMIC profile mode is unavailable for {name}: {}x{}",
+                    dimensions.0, dimensions.1
+                )
+            })?;
+        let scale_milli = (logical_monitor.scale() * 1000.0).round();
+        if !scale_milli.is_finite() || scale_milli <= 0.0 || scale_milli > u32::MAX as f64 {
+            return Err(format!("COSMIC profile scale is invalid for {name}"));
+        }
+
+        plans.push(CosmicOutputPlan {
+            name: name.to_owned(),
+            position: logical_monitor.position(),
+            transform: logical_monitor.transform(),
+            scale_milli: scale_milli as u32,
+            mode: (mode.width, mode.height, mode.refresh_mhz),
+        });
+    }
+
+    Ok(plans)
+}
+
+fn parse_mode_dimensions(mode_id: &str) -> Option<(i32, i32)> {
+    let dimensions = mode_id.split('@').next()?;
+    let (width, height) = dimensions.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
+}
+
 pub fn should_reload_kanshi(xdg_current_desktop: Option<&str>) -> bool {
     !xdg_current_desktop
         .map(|desktop| desktop.to_ascii_lowercase().contains("cosmic"))
@@ -843,6 +918,75 @@ mod tests {
         assert_eq!(
             cosmic_profile_apply_status(),
             Err("COSMIC profile apply is unavailable: the Wayland observer does not retain output-manager, head, or mode handles needed for create_configuration")
+        );
+    }
+
+    #[test]
+    fn plans_cosmic_profile_against_observed_output_without_applying_it() {
+        let snapshot = OutputSnapshot {
+            serial: 11,
+            heads: vec![snapshot_head(
+                "DP-1",
+                true,
+                Some((320, 180)),
+                Some(3),
+                Some(1.25),
+                2560,
+                1440,
+                Some(144_000),
+            )],
+        };
+        let profile = vec![MonitorApply::test_new(
+            "DP-1",
+            "2560x1440@144Hz",
+            10,
+            20,
+            1.5,
+            0,
+            true,
+        )];
+
+        assert_eq!(
+            plan_cosmic_profile(&snapshot, &profile).unwrap(),
+            vec![CosmicOutputPlan {
+                name: "DP-1".to_string(),
+                position: (10, 20),
+                transform: 0,
+                scale_milli: 1500,
+                mode: (2560, 1440, Some(144_000)),
+            }]
+        );
+        assert_eq!(cosmic_profile_apply_status().is_err(), true);
+    }
+
+    #[test]
+    fn rejects_cosmic_profile_when_output_mode_is_not_observed() {
+        let snapshot = OutputSnapshot {
+            serial: 11,
+            heads: vec![snapshot_head(
+                "DP-1",
+                true,
+                Some((0, 0)),
+                Some(0),
+                Some(1.0),
+                1920,
+                1080,
+                Some(60_000),
+            )],
+        };
+        let profile = vec![MonitorApply::test_new(
+            "DP-1",
+            "3840x2160@60Hz",
+            0,
+            0,
+            1.0,
+            0,
+            true,
+        )];
+
+        assert_eq!(
+            plan_cosmic_profile(&snapshot, &profile),
+            Err("COSMIC profile mode is unavailable for DP-1: 3840x2160".to_string())
         );
     }
 
