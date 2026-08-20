@@ -9,7 +9,11 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
+use calloop::channel as calloop_channel;
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
 use wayland_client::{
     event_created_child,
     globals::{registry_queue_init, GlobalListContents},
@@ -122,18 +126,28 @@ pub struct WaylandOutputObserver;
 
 impl WaylandOutputObserver {
     /// Connect to the compositor referenced by the current environment and start
-    /// a dedicated blocking observation thread that forwards every
-    /// `zwlr_output_manager_v1.done` snapshot through the returned receiver.
-    pub fn observe(
-    ) -> Result<Receiver<Result<OutputSnapshot, WaylandObserverError>>, WaylandObserverError> {
+    /// a dedicated observation thread. The thread runs a `calloop` event loop
+    /// with two sources: the Wayland connection (forwarding every
+    /// `zwlr_output_manager_v1.done` snapshot through the returned receiver)
+    /// and an inbound channel for apply/test requests submitted through the
+    /// returned [`WaylandApplyHandle`].
+    #[allow(clippy::type_complexity)]
+    pub fn observe() -> Result<
+        (
+            Receiver<Result<OutputSnapshot, WaylandObserverError>>,
+            WaylandApplyHandle,
+        ),
+        WaylandObserverError,
+    > {
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let (publication_tx, publication_rx) = mpsc::channel();
+        let (apply_tx, apply_rx) = calloop_channel::channel::<ApplyRequestMessage>();
 
         thread::Builder::new()
             .name("wayland-output-observer".to_string())
             .spawn(move || {
                 let startup = Self::connect_and_bind();
-                let (connection, mut queue, mut state) = match startup {
+                let (connection, queue, mut state) = match startup {
                     Ok(parts) => {
                         let _ = startup_tx.send(Ok(()));
                         parts
@@ -144,12 +158,12 @@ impl WaylandOutputObserver {
                     }
                 };
 
-                Self::run_observer_loop(connection, &mut queue, &mut state, publication_tx);
+                Self::run_observer_loop(connection, queue, &mut state, publication_tx, apply_rx);
             })
             .map_err(|error| WaylandObserverError::ThreadSpawnFailed(error.to_string()))?;
 
         match startup_rx.recv() {
-            Ok(Ok(())) => Ok(publication_rx),
+            Ok(Ok(())) => Ok((publication_rx, WaylandApplyHandle { sender: apply_tx })),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(WaylandObserverError::DispatchFailed(format!(
                 "observer startup channel closed unexpectedly: {error}"
@@ -193,36 +207,188 @@ impl WaylandOutputObserver {
     ) -> Result<(EventQueue<ObserverState>, ObserverState), WaylandObserverError> {
         let (globals, queue) = registry_queue_init::<ObserverState>(connection)
             .map_err(|error| WaylandObserverError::GlobalDiscoveryFailed(error.to_string()))?;
+        let qh = queue.handle();
         let manager: ZwlrOutputManagerV1 =
-            globals.bind(&queue.handle(), 1..=4, ()).map_err(|_| {
-                WaylandObserverError::UnsupportedGlobal {
+            globals
+                .bind(&qh, 1..=4, ())
+                .map_err(|_| WaylandObserverError::UnsupportedGlobal {
                     name: "zwlr_output_manager_v1",
-                }
-            })?;
+                })?;
 
         let state = ObserverState {
-            _manager: Some(manager),
+            manager: Some(manager),
+            queue_handle: Some(qh),
             ..ObserverState::default()
         };
 
         Ok((queue, state))
     }
 
+    /// Runs the dedicated observer thread's `calloop` event loop.
+    ///
+    /// Two sources are registered on it: the Wayland connection (bridged via
+    /// `calloop-wayland-source`'s `WaylandSource`, which owns flushing
+    /// outgoing requests and reading incoming events) and the inbound apply
+    /// request channel. Apply requests must be handled on this exact thread
+    /// because the retained `zwlr_output_head_v1`/`zwlr_output_mode_v1`
+    /// proxies in `state.handles` are only valid on the connection that
+    /// discovered them.
     fn run_observer_loop(
-        _connection: Connection,
-        queue: &mut EventQueue<ObserverState>,
+        connection: Connection,
+        queue: EventQueue<ObserverState>,
         state: &mut ObserverState,
         publication_tx: Sender<Result<OutputSnapshot, WaylandObserverError>>,
+        apply_rx: calloop_channel::Channel<ApplyRequestMessage>,
     ) {
-        loop {
-            let publish_status = publish_pending_results(state, &publication_tx);
-            if publish_status.should_stop() {
-                break;
+        let mut event_loop: EventLoop<ObserverState> = match EventLoop::try_new() {
+            Ok(event_loop) => event_loop,
+            Err(error) => {
+                state.store_terminal(WaylandObserverError::ThreadSpawnFailed(error.to_string()));
+                publish_pending_results(state, &publication_tx);
+                return;
             }
+        };
 
-            if let Err(error) = queue.blocking_dispatch(state) {
-                state.store_terminal(WaylandObserverError::DispatchFailed(error.to_string()));
+        let loop_handle = event_loop.handle();
+
+        if let Err(error) = WaylandSource::new(connection, queue).insert(loop_handle.clone()) {
+            state.store_terminal(WaylandObserverError::ThreadSpawnFailed(error.to_string()));
+            publish_pending_results(state, &publication_tx);
+            return;
+        }
+
+        let insert_result = loop_handle.insert_source(apply_rx, |event, _, state| {
+            if let calloop_channel::Event::Msg(message) = event {
+                handle_apply_request(state, message);
             }
+        });
+        if let Err(error) = insert_result {
+            state.store_terminal(WaylandObserverError::ThreadSpawnFailed(error.to_string()));
+            publish_pending_results(state, &publication_tx);
+            return;
+        }
+
+        let signal = event_loop.get_signal();
+        let run_result = event_loop.run(None::<Duration>, state, |state| {
+            if publish_pending_results(state, &publication_tx).should_stop() {
+                signal.stop();
+            }
+        });
+
+        if let Err(error) = run_result {
+            state.store_terminal(WaylandObserverError::DispatchFailed(error.to_string()));
+        }
+        publish_pending_results(state, &publication_tx);
+    }
+}
+
+/// A request to apply (or test) an output configuration, expressed in terms
+/// meaningful across the D-Bus/async boundary: compositor-stable output
+/// names rather than Wayland protocol object IDs. The observer thread
+/// resolves these names against its retained proxies before building a
+/// `ZwlrOutputConfigurationV1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CosmicHeadRequest {
+    pub name: String,
+    pub enabled: bool,
+    /// Requested mode dimensions (width, height). Matched against retained
+    /// mode proxies by dimensions only, mirroring `plan_cosmic_profile`.
+    pub mode: Option<(i32, i32)>,
+    pub position: (i32, i32),
+    pub transform: u32,
+    pub scale: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CosmicApplyRequest {
+    pub serial: u32,
+    pub heads: Vec<CosmicHeadRequest>,
+}
+
+/// Message sent through the calloop channel into the observer thread.
+#[derive(Debug)]
+pub(crate) struct ApplyRequestMessage {
+    pub request: CosmicApplyRequest,
+    pub verify_only: bool,
+    pub response: Sender<Result<(), String>>,
+}
+
+/// Handle for submitting an apply/test request into the dedicated observer
+/// thread from outside it. Intended to be called from
+/// `tokio::task::spawn_blocking` so the calling async executor is never
+/// blocked on the compositor round-trip.
+#[derive(Debug, Clone)]
+pub struct WaylandApplyHandle {
+    sender: calloop_channel::Sender<ApplyRequestMessage>,
+}
+
+impl WaylandApplyHandle {
+    #[cfg(test)]
+    pub(crate) fn for_test(sender: calloop_channel::Sender<ApplyRequestMessage>) -> Self {
+        Self { sender }
+    }
+
+    /// Submit a configuration request and block for the compositor's
+    /// outcome. Must not be called from an async context directly; wrap in
+    /// `tokio::task::spawn_blocking`.
+    pub fn apply(&self, request: CosmicApplyRequest, verify_only: bool) -> Result<(), String> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.sender
+            .send(ApplyRequestMessage {
+                request,
+                verify_only,
+                response: response_tx,
+            })
+            .map_err(|_| "Wayland observer thread is no longer running".to_string())?;
+        response_rx
+            .recv()
+            .map_err(|_| "Wayland observer thread dropped the configuration response".to_string())?
+    }
+}
+
+/// Resolves a name-based [`CosmicApplyRequest`] against retained proxies and
+/// submits it to the compositor. Runs on the observer thread only.
+fn handle_apply_request(state: &mut ObserverState, message: ApplyRequestMessage) {
+    let Some(manager) = state.manager.clone() else {
+        let _ = message
+            .response
+            .send(Err("Wayland output manager is unavailable".to_string()));
+        return;
+    };
+    let Some(qh) = state.queue_handle.clone() else {
+        let _ = message.response.send(Err(
+            "Wayland observer queue handle is unavailable".to_string()
+        ));
+        return;
+    };
+    if state.configuration_response.is_some() {
+        let _ = message.response.send(Err(
+            "another COSMIC output configuration request is already in flight".to_string(),
+        ));
+        return;
+    }
+
+    let resolved = state
+        .handles
+        .cosmic_index
+        .resolve(&message.request)
+        .and_then(|request| {
+            state
+                .handles
+                .build_output_configuration(&manager, &request, &qh)
+        });
+
+    match resolved {
+        Ok(configuration) => {
+            state.configuration_response = Some(message.response);
+            if message.verify_only {
+                configuration.test();
+            } else {
+                configuration.apply();
+            }
+        }
+        Err(error) => {
+            let _ = message.response.send(Err(error));
         }
     }
 }
@@ -231,7 +397,8 @@ impl WaylandOutputObserver {
 struct ObserverState {
     collector: SnapshotCollector,
     handles: OutputManagementHandles,
-    _manager: Option<ZwlrOutputManagerV1>,
+    manager: Option<ZwlrOutputManagerV1>,
+    queue_handle: Option<QueueHandle<Self>>,
     configuration_response: Option<Sender<Result<(), String>>>,
     terminal_error: Option<WaylandObserverError>,
     terminal_reached: bool,
@@ -353,6 +520,10 @@ impl Dispatch<ZwlrOutputHeadV1, ()> for ObserverState {
 
         let result = match event {
             zwlr_output_head_v1::Event::Name { name } => {
+                state
+                    .handles
+                    .cosmic_index
+                    .note_head_name(head_id, name.clone());
                 state.collector.set_head_name(head_id, name)
             }
             zwlr_output_head_v1::Event::Description { description } => {
@@ -410,6 +581,12 @@ impl Dispatch<ZwlrOutputModeV1, ()> for ObserverState {
         let mode_id = proxy.id().protocol_id();
         let result = match event {
             zwlr_output_mode_v1::Event::Size { width, height } => {
+                if let Some(head_id) = state.handles.head_id_for_mode(mode_id) {
+                    state
+                        .handles
+                        .cosmic_index
+                        .note_mode_size(head_id, mode_id, width, height);
+                }
                 state.collector.set_mode_size(mode_id, width, height)
             }
             zwlr_output_mode_v1::Event::Refresh { refresh } => {
@@ -441,6 +618,11 @@ impl Dispatch<ZwlrOutputModeV1, ()> for ObserverState {
 pub(crate) struct OutputManagementHandles {
     heads: HashMap<u32, ZwlrOutputHeadV1>,
     modes: HashMap<u32, RetainedMode>,
+    /// Pure-data name/mode index kept alongside the retained proxies so a
+    /// name-based [`CosmicApplyRequest`] can be resolved to protocol object
+    /// IDs. Deliberately holds no proxies itself so it can be unit tested
+    /// without a live Wayland connection.
+    cosmic_index: CosmicHeadIndex,
 }
 
 #[derive(Debug)]
@@ -472,6 +654,11 @@ impl OutputManagementHandles {
 
     fn release_mode(&mut self, mode_id: u32) {
         self.modes.remove(&mode_id);
+    }
+
+    /// Returns the head ID that owns a retained mode proxy, if any.
+    fn head_id_for_mode(&self, mode_id: u32) -> Option<u32> {
+        self.modes.get(&mode_id).map(|mode| mode.head_id)
     }
 
     fn build_output_configuration(
@@ -569,6 +756,81 @@ impl OutputConfigurationRequest {
             return Err("output configuration contains an invalid scale".to_string());
         }
         Ok(())
+    }
+}
+
+/// Pure-data index mapping compositor-stable output names (and mode
+/// dimensions) to the protocol object IDs retained by
+/// [`OutputManagementHandles`]. Kept separate from the proxy-holding maps so
+/// it can be constructed and unit tested without a live Wayland connection.
+#[derive(Debug, Default)]
+pub(crate) struct CosmicHeadIndex {
+    head_ids_by_name: HashMap<String, u32>,
+    mode_ids_by_head: HashMap<u32, HashMap<(i32, i32), u32>>,
+}
+
+impl CosmicHeadIndex {
+    fn note_head_name(&mut self, head_id: u32, name: String) {
+        self.head_ids_by_name.insert(name, head_id);
+    }
+
+    fn note_mode_size(&mut self, head_id: u32, mode_id: u32, width: i32, height: i32) {
+        self.mode_ids_by_head
+            .entry(head_id)
+            .or_default()
+            .insert((width, height), mode_id);
+    }
+
+    fn head_id(&self, name: &str) -> Option<u32> {
+        self.head_ids_by_name.get(name).copied()
+    }
+
+    fn mode_id(&self, head_id: u32, width: i32, height: i32) -> Option<u32> {
+        self.mode_ids_by_head
+            .get(&head_id)?
+            .get(&(width, height))
+            .copied()
+    }
+
+    /// Resolves a name-based [`CosmicApplyRequest`] into a protocol-ID-based
+    /// [`OutputConfigurationRequest`] that `OutputManagementHandles` can act
+    /// on directly.
+    pub(crate) fn resolve(
+        &self,
+        request: &CosmicApplyRequest,
+    ) -> Result<OutputConfigurationRequest, String> {
+        let heads = request
+            .heads
+            .iter()
+            .map(|head| {
+                let head_id = self
+                    .head_id(&head.name)
+                    .ok_or_else(|| format!("unknown COSMIC output: {}", head.name))?;
+                let mode_id = match head.mode {
+                    Some((width, height)) => {
+                        Some(self.mode_id(head_id, width, height).ok_or_else(|| {
+                            format!(
+                                "COSMIC output mode unavailable for {}: {width}x{height}",
+                                head.name
+                            )
+                        })?)
+                    }
+                    None => None,
+                };
+                Ok(OutputHeadConfiguration {
+                    head_id,
+                    enabled: head.enabled,
+                    mode_id,
+                    position: head.position,
+                    transform: head.transform,
+                    scale: head.scale,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(OutputConfigurationRequest {
+            serial: request.serial,
+            heads,
+        })
     }
 }
 
@@ -957,6 +1219,149 @@ mod output_configuration_tests {
             configuration_outcome(zwlr_output_configuration_v1::Event::Cancelled),
             Some(Err("COSMIC output configuration cancelled".to_string()))
         );
+    }
+}
+
+#[cfg(test)]
+mod cosmic_apply_bridge_tests {
+    use super::{ApplyRequestMessage, CosmicApplyRequest, CosmicHeadIndex, CosmicHeadRequest};
+    use calloop::channel;
+    use std::thread;
+    use std::time::Duration;
+
+    fn head_request(name: &str, mode: Option<(i32, i32)>) -> CosmicHeadRequest {
+        CosmicHeadRequest {
+            name: name.to_string(),
+            enabled: mode.is_some(),
+            mode,
+            position: (0, 0),
+            transform: 0,
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn resolves_named_heads_and_modes_to_protocol_ids() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(7, "DP-1".to_string());
+        index.note_mode_size(7, 20, 2560, 1440);
+
+        let request = CosmicApplyRequest {
+            serial: 3,
+            heads: vec![head_request("DP-1", Some((2560, 1440)))],
+        };
+
+        let resolved = index.resolve(&request).unwrap();
+        assert_eq!(resolved.serial, 3);
+        assert_eq!(resolved.heads[0].head_id, 7);
+        assert_eq!(resolved.heads[0].mode_id, Some(20));
+    }
+
+    #[test]
+    fn rejects_unknown_output_name() {
+        let index = CosmicHeadIndex::default();
+        let request = CosmicApplyRequest {
+            serial: 1,
+            heads: vec![head_request("DP-9", None)],
+        };
+
+        assert_eq!(
+            index.resolve(&request),
+            Err("unknown COSMIC output: DP-9".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_unavailable_mode_dimensions() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(1, "eDP-1".to_string());
+        index.note_mode_size(1, 5, 1920, 1080);
+
+        let request = CosmicApplyRequest {
+            serial: 1,
+            heads: vec![head_request("eDP-1", Some((3840, 2160)))],
+        };
+
+        assert_eq!(
+            index.resolve(&request),
+            Err("COSMIC output mode unavailable for eDP-1: 3840x2160".to_string())
+        );
+    }
+
+    /// Exercises the actual `calloop` channel bridge end to end (no live
+    /// Wayland compositor involved): a fake responder standing in for the
+    /// observer thread's Wayland-specific handling receives the message
+    /// through a real `calloop::EventLoop` and replies through the embedded
+    /// response channel.
+    #[test]
+    fn wayland_apply_handle_round_trips_through_calloop_channel() {
+        let (sender, apply_rx) = channel::channel::<ApplyRequestMessage>();
+        let handle = super::WaylandApplyHandle::for_test(sender);
+
+        let worker = thread::spawn(move || {
+            let mut event_loop: calloop::EventLoop<()> = calloop::EventLoop::try_new().unwrap();
+            let loop_handle = event_loop.handle();
+            loop_handle
+                .insert_source(apply_rx, |event, _, _| {
+                    if let channel::Event::Msg(message) = event {
+                        assert_eq!(message.request.serial, 42);
+                        assert!(!message.verify_only);
+                        let _ = message.response.send(Ok(()));
+                    }
+                })
+                .unwrap();
+            event_loop
+                .dispatch(Duration::from_secs(2), &mut ())
+                .unwrap();
+        });
+
+        let result = handle.apply(
+            CosmicApplyRequest {
+                serial: 42,
+                heads: Vec::new(),
+            },
+            false,
+        );
+
+        assert_eq!(result, Ok(()));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn wayland_apply_handle_surfaces_compositor_failure() {
+        let (sender, apply_rx) = channel::channel::<ApplyRequestMessage>();
+        let handle = super::WaylandApplyHandle::for_test(sender);
+
+        let worker = thread::spawn(move || {
+            let mut event_loop: calloop::EventLoop<()> = calloop::EventLoop::try_new().unwrap();
+            let loop_handle = event_loop.handle();
+            loop_handle
+                .insert_source(apply_rx, |event, _, _| {
+                    if let channel::Event::Msg(message) = event {
+                        let _ = message
+                            .response
+                            .send(Err("COSMIC output configuration failed".to_string()));
+                    }
+                })
+                .unwrap();
+            event_loop
+                .dispatch(Duration::from_secs(2), &mut ())
+                .unwrap();
+        });
+
+        let result = handle.apply(
+            CosmicApplyRequest {
+                serial: 1,
+                heads: Vec::new(),
+            },
+            true,
+        );
+
+        assert_eq!(
+            result,
+            Err("COSMIC output configuration failed".to_string())
+        );
+        worker.join().unwrap();
     }
 }
 

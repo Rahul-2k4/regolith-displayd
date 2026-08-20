@@ -1,6 +1,6 @@
 use log::{error, info, warn};
 use regolith_displayd::wayland_observer::{
-    OutputSnapshot, WaylandObserverError, WaylandOutputObserver,
+    OutputSnapshot, WaylandApplyHandle, WaylandObserverError, WaylandOutputObserver,
 };
 use regolith_displayd::{
     wayland_side_effect_stage, DisplayManager, DisplayServer, WaylandSideEffectStage,
@@ -27,8 +27,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sway_connection_ref = connect_sway_backend().await?;
     let backend = select_display_backend(cosmic, sway_connection_ref.is_some());
 
+    // The apply handle is wired into DisplayServer in a follow-up change;
+    // for now it's kept alive but unused so this crate keeps compiling
+    // against WaylandOutputObserver::observe()'s new tuple return.
+    let mut _wayland_apply_handle: Option<WaylandApplyHandle> = None;
     let wayland_observer_handle = if backend == DisplayBackend::Wayland {
-        let (handle, ready) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
+        let (handle, ready, apply_handle) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
+        _wayland_apply_handle = Some(apply_handle);
         match wait_for_wayland_readiness(ready, WAYLAND_READINESS_TIMEOUT).await {
             Ok(false) => {
                 warn!(
@@ -219,16 +224,17 @@ fn start_wayland_state_observer(
     (
         JoinHandle<Result<(), String>>,
         oneshot::Receiver<Result<(), String>>,
+        WaylandApplyHandle,
     ),
     Box<dyn Error>,
 > {
-    let receiver = WaylandOutputObserver::observe()?;
+    let (receiver, apply_handle) = WaylandOutputObserver::observe()?;
     let (ready_sender, ready_receiver) = oneshot::channel();
     info!("Starting Wayland output observation for COSMIC");
     let handle = tokio::task::spawn_blocking(move || {
         consume_wayland_observer(manager_ref, receiver, Some(ready_sender))
     });
-    Ok((handle, ready_receiver))
+    Ok((handle, ready_receiver, apply_handle))
 }
 
 fn consume_wayland_observer(
