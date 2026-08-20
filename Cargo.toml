@@ -5,6 +5,8 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
+calloop = "0.13"
+calloop-wayland-source = "0.3"
 lazy_static = "1.4.0"
 log = "0.4"
 num = "0.4.0"
