@@ -17,7 +17,9 @@ use tokio::sync::Mutex;
 use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
-use crate::wayland_observer::OutputSnapshot;
+use crate::wayland_observer::{
+    CosmicApplyRequest, CosmicHeadRequest, OutputSnapshot, WaylandApplyHandle,
+};
 
 lazy_static! {
     static ref ZBUS_CONNECTION: Arc<Mutex<Option<zbus::Connection>>> = Arc::new(Mutex::new(None));
@@ -150,6 +152,61 @@ pub fn plan_cosmic_profile(
     Ok(plans)
 }
 
+/// Builds a name-based COSMIC apply request from the requested logical
+/// monitors, padding in every other known monitor as disabled so the
+/// observer thread's `OutputConfigurationRequest::validate` (which requires
+/// every retained head to be configured exactly once) can be satisfied.
+/// Mirrors `write_kanshi_profile`'s `get_disabled_monitors` handling of the
+/// same active/inactive split for the Sway path.
+fn build_cosmic_apply_request(
+    serial: u32,
+    monitors: &[Monitor],
+    mutter_logical_monitors: &[MonitorApply],
+) -> Result<CosmicApplyRequest, String> {
+    let mut heads = Vec::with_capacity(monitors.len());
+    let mut configured_names = HashSet::new();
+
+    for logical_monitor in mutter_logical_monitors {
+        let (name, mode_id) = logical_monitor.output_name_and_mode().ok_or_else(|| {
+            "COSMIC apply request output has no physical monitor identity".to_string()
+        })?;
+        if !configured_names.insert(name.to_string()) {
+            return Err(format!(
+                "COSMIC apply request contains duplicate output: {name}"
+            ));
+        }
+        let dimensions = parse_mode_dimensions(mode_id).ok_or_else(|| {
+            format!("COSMIC apply request mode is malformed for {name}: {mode_id}")
+        })?;
+
+        heads.push(CosmicHeadRequest {
+            name: name.to_string(),
+            enabled: true,
+            mode: Some(dimensions),
+            position: logical_monitor.position(),
+            transform: logical_monitor.transform(),
+            scale: logical_monitor.scale(),
+        });
+    }
+
+    for monitor in monitors {
+        let name = monitor.get_dpy_name();
+        if configured_names.contains(&name) {
+            continue;
+        }
+        heads.push(CosmicHeadRequest {
+            name,
+            enabled: false,
+            mode: None,
+            position: (0, 0),
+            transform: 0,
+            scale: 1.0,
+        });
+    }
+
+    Ok(CosmicApplyRequest { serial, heads })
+}
+
 fn parse_mode_dimensions(mode_id: &str) -> Option<(i32, i32)> {
     let dimensions = mode_id.split('@').next()?;
     let (width, height) = dimensions.split_once('x')?;
@@ -167,6 +224,13 @@ pub struct DisplayServer {
     manager: Arc<Mutex<DisplayManager>>,
     // TODO: Make independent of sway
     sway_connection: Option<Arc<Mutex<Connection>>>,
+    /// Set explicitly via `with_cosmic_desktop` rather than read from
+    /// `XDG_CURRENT_DESKTOP` here, to avoid a racy environment-variable read
+    /// from within an async method under parallel tests.
+    cosmic_desktop: bool,
+    /// Handle for submitting apply/test requests into the dedicated Wayland
+    /// observer thread. Only present when running under COSMIC.
+    wayland_apply_handle: Option<WaylandApplyHandle>,
 }
 fn commit_refreshed_monitor_info(
     manager: &mut DisplayManager,
@@ -268,6 +332,11 @@ impl DisplayServer {
         properties: DisplayManagerProperties,
     ) -> zbus::fdo::Result<()> {
         debug!("Configuration Method: {method}");
+        if self.cosmic_desktop {
+            return self
+                .apply_monitors_config_cosmic(serial, method, mutter_logical_monitors)
+                .await;
+        }
         let sway_connection = self.sway_connection.as_ref().ok_or_else(|| {
             zbus::fdo::Error::Failed(String::from("Sway IPC backend is unavailable"))
         })?;
@@ -344,7 +413,75 @@ impl DisplayServer {
         DisplayServer {
             manager,
             sway_connection,
+            cosmic_desktop: false,
+            wayland_apply_handle: None,
         }
+    }
+
+    /// Marks this server as running under COSMIC, routing
+    /// `apply_monitors_config` through the Wayland observer thread instead
+    /// of Sway/Kanshi.
+    pub fn with_cosmic_desktop(mut self, cosmic_desktop: bool) -> DisplayServer {
+        self.cosmic_desktop = cosmic_desktop;
+        self
+    }
+
+    /// Attaches the handle used to submit apply/test requests into the
+    /// dedicated Wayland observer thread.
+    pub fn with_wayland_apply_handle(
+        mut self,
+        wayland_apply_handle: Option<WaylandApplyHandle>,
+    ) -> DisplayServer {
+        self.wayland_apply_handle = wayland_apply_handle;
+        self
+    }
+
+    /// COSMIC counterpart of `apply_monitors_config`: builds a name-based
+    /// `CosmicApplyRequest` from the requested logical monitors (padding in
+    /// the remaining known outputs as disabled, mirroring the Sway path's
+    /// Kanshi profile generation), then submits it to the Wayland observer
+    /// thread and blocks (off the async executor) for the compositor's
+    /// Succeeded/Failed/Cancelled outcome.
+    async fn apply_monitors_config_cosmic(
+        &mut self,
+        serial: u32,
+        method: u32,
+        mutter_logical_monitors: Vec<MonitorApply>,
+    ) -> zbus::fdo::Result<()> {
+        let apply_handle = self.wayland_apply_handle.clone().ok_or_else(|| {
+            zbus::fdo::Error::Failed("COSMIC Wayland apply handle is unavailable".to_string())
+        })?;
+
+        let manager_obj = self.manager.lock().await;
+        if serial != manager_obj.serial {
+            error!("Invalid configuration recieved for method apply_monitors_config: Wrong serial");
+            return Err(zbus::fdo::Error::InvalidArgs(String::from("Wrong serial")));
+        }
+
+        let request =
+            build_cosmic_apply_request(serial, &manager_obj.monitors, &mutter_logical_monitors)
+                .map_err(zbus::fdo::Error::InvalidArgs)?;
+        drop(manager_obj);
+
+        let verify_only = method == 0;
+        let outcome = tokio::task::spawn_blocking(move || apply_handle.apply(request, verify_only))
+            .await
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!("COSMIC apply task failed to join: {error}"))
+            })?;
+        outcome.map_err(zbus::fdo::Error::Failed)?;
+
+        if verify_only {
+            return Ok(());
+        }
+
+        // The Wayland observer thread's own `done` snapshot (installed via
+        // `install_wayland_snapshot`) is the source of truth for refreshed
+        // monitor state under COSMIC, so only the change signal is emitted
+        // here, mirroring `wayland_stage_after_reload`/`Signal`.
+        DisplayManager::emit_monitors_changed()
+            .await
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
     pub async fn run_server(self) -> Result<(), Box<dyn Error>> {
         info!("Starting display daemon");
@@ -853,7 +990,10 @@ mod tests {
     use super::*;
     use crate::modes::Modes;
     use crate::monitor::{LogicalMonitor, Monitor, MonitorApply};
-    use crate::wayland_observer::{OutputHeadSnapshot, OutputModeSnapshot, OutputSnapshot};
+    use crate::wayland_observer::{
+        ApplyRequestMessage, OutputHeadSnapshot, OutputModeSnapshot, OutputSnapshot,
+        WaylandApplyHandle,
+    };
 
     #[tokio::test]
     async fn run_server_registers_dbus_without_sway_monitor_preflight() {
@@ -885,6 +1025,174 @@ mod tests {
         let server = DisplayServer::new(manager, None).await;
 
         assert!(!server.apply_monitors_config_allowed().await);
+    }
+
+    /// Fake responder standing in for the observer thread's Wayland-specific
+    /// handling: it receives the apply request through a real `calloop`
+    /// event loop (exercising the actual bridge mechanism) and replies with
+    /// a caller-supplied outcome, without touching any Wayland type.
+    fn spawn_fake_wayland_apply_responder(
+        outcome: Result<(), String>,
+    ) -> (WaylandApplyHandle, std::thread::JoinHandle<()>) {
+        let (sender, apply_rx) = calloop::channel::channel::<ApplyRequestMessage>();
+        let handle = WaylandApplyHandle::for_test(sender);
+        let worker = std::thread::spawn(move || {
+            let mut event_loop: calloop::EventLoop<()> = calloop::EventLoop::try_new().unwrap();
+            let loop_handle = event_loop.handle();
+            loop_handle
+                .insert_source(apply_rx, move |event, _, _| {
+                    if let calloop::channel::Event::Msg(message) = event {
+                        let _ = message.response.send(outcome.clone());
+                    }
+                })
+                .unwrap();
+            event_loop
+                .dispatch(std::time::Duration::from_secs(2), &mut ())
+                .unwrap();
+        });
+        (handle, worker)
+    }
+
+    #[tokio::test]
+    async fn cosmic_desktop_takes_the_wayland_apply_path_without_sway_connection() {
+        let manager = Arc::new(Mutex::new(build_manager(
+            vec![Monitor::test_new(
+                "eDP-1",
+                "Regolith",
+                "Panel",
+                "A1",
+                vec![Modes::test_new("1920x1080@60Hz")],
+            )],
+            Vec::new(),
+        )));
+        let (apply_handle, worker) = spawn_fake_wayland_apply_responder(Ok(()));
+        let mut server = DisplayServer::new(manager, None)
+            .await
+            .with_cosmic_desktop(true)
+            .with_wayland_apply_handle(Some(apply_handle));
+
+        let result = server
+            .apply_monitors_config(
+                1,
+                1,
+                vec![MonitorApply::test_new(
+                    "eDP-1",
+                    "1920x1080@60Hz",
+                    0,
+                    0,
+                    1.0,
+                    0,
+                    true,
+                )],
+                DisplayManagerProperties::new(),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cosmic_desktop_verify_only_does_not_signal_or_require_reload() {
+        let manager = Arc::new(Mutex::new(build_manager(Vec::new(), Vec::new())));
+        let (apply_handle, worker) = spawn_fake_wayland_apply_responder(Ok(()));
+        let mut server = DisplayServer::new(manager, None)
+            .await
+            .with_cosmic_desktop(true)
+            .with_wayland_apply_handle(Some(apply_handle));
+
+        let result = server
+            .apply_monitors_config(1, 0, Vec::new(), DisplayManagerProperties::new())
+            .await;
+
+        assert!(result.is_ok());
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cosmic_desktop_surfaces_compositor_failure() {
+        let manager = Arc::new(Mutex::new(build_manager(Vec::new(), Vec::new())));
+        let (apply_handle, worker) = spawn_fake_wayland_apply_responder(Err(
+            "COSMIC output configuration failed".to_string(),
+        ));
+        let mut server = DisplayServer::new(manager, None)
+            .await
+            .with_cosmic_desktop(true)
+            .with_wayland_apply_handle(Some(apply_handle));
+
+        let result = server
+            .apply_monitors_config(1, 1, Vec::new(), DisplayManagerProperties::new())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(zbus::fdo::Error::Failed(message))
+                if message == "COSMIC output configuration failed"
+        ));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cosmic_desktop_without_apply_handle_returns_backend_error() {
+        let manager = Arc::new(Mutex::new(build_manager(Vec::new(), Vec::new())));
+        let mut server = DisplayServer::new(manager, None)
+            .await
+            .with_cosmic_desktop(true);
+
+        let result = server
+            .apply_monitors_config(1, 1, Vec::new(), DisplayManagerProperties::new())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(zbus::fdo::Error::Failed(message))
+                if message == "COSMIC Wayland apply handle is unavailable"
+        ));
+    }
+
+    #[test]
+    fn cosmic_apply_request_pads_unconfigured_outputs_as_disabled() {
+        // COSMIC-observed monitors carry the connector name as their display
+        // name (vendor/model/serial are unknown over wlr-output-management),
+        // matching `Monitor::from_snapshot`'s `snapshot_identity` mapping.
+        let monitors = vec![
+            Monitor::test_new("eDP-1", "", "", "", vec![Modes::test_new("1920x1080@60Hz")]),
+            Monitor::test_new(
+                "HDMI-A-1",
+                "",
+                "",
+                "",
+                vec![Modes::test_new("1920x1080@60Hz")],
+            ),
+        ];
+        let requested = vec![MonitorApply::test_new(
+            "eDP-1",
+            "1920x1080@60Hz",
+            10,
+            20,
+            1.0,
+            0,
+            true,
+        )];
+
+        let request = build_cosmic_apply_request(7, &monitors, &requested).unwrap();
+
+        assert_eq!(request.serial, 7);
+        assert_eq!(request.heads.len(), 2);
+        let enabled = request
+            .heads
+            .iter()
+            .find(|head| head.name == "eDP-1")
+            .unwrap();
+        assert!(enabled.enabled);
+        assert_eq!(enabled.mode, Some((1920, 1080)));
+        let disabled = request
+            .heads
+            .iter()
+            .find(|head| head.name == "HDMI-A-1")
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.mode, None);
     }
 
     fn build_manager(

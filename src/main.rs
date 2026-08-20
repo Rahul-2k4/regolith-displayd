@@ -27,13 +27,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sway_connection_ref = connect_sway_backend().await?;
     let backend = select_display_backend(cosmic, sway_connection_ref.is_some());
 
-    // The apply handle is wired into DisplayServer in a follow-up change;
-    // for now it's kept alive but unused so this crate keeps compiling
-    // against WaylandOutputObserver::observe()'s new tuple return.
-    let mut _wayland_apply_handle: Option<WaylandApplyHandle> = None;
+    let mut wayland_apply_handle = None;
     let wayland_observer_handle = if backend == DisplayBackend::Wayland {
         let (handle, ready, apply_handle) = start_wayland_state_observer(Arc::clone(&manager_ref))?;
-        _wayland_apply_handle = Some(apply_handle);
+        wayland_apply_handle = Some(apply_handle);
         match wait_for_wayland_readiness(ready, WAYLAND_READINESS_TIMEOUT).await {
             Ok(false) => {
                 warn!(
@@ -53,7 +50,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // COSMIC observes output events through Wayland while retaining Sway IPC for D-Bus compatibility.
-    let server = DisplayServer::new(Arc::clone(&manager_ref), sway_connection_ref.clone()).await;
+    let server = DisplayServer::new(Arc::clone(&manager_ref), sway_connection_ref.clone())
+        .await
+        .with_cosmic_desktop(cosmic)
+        .with_wayland_apply_handle(wayland_apply_handle);
     server.run_server().await?;
 
     if let Some(observer_handle) = wayland_observer_handle {
