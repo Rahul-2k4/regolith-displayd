@@ -790,20 +790,14 @@ impl CosmicHeadIndex {
     }
 
     fn note_mode_size(&mut self, head_id: u32, mode_id: u32, width: i32, height: i32) {
-        let mode = self
-            .modes_by_id
-            .entry(mode_id)
-            .or_default();
+        let mode = self.modes_by_id.entry(mode_id).or_default();
         mode.head_id = head_id;
         mode.width = Some(width);
         mode.height = Some(height);
     }
 
     fn note_mode_refresh(&mut self, head_id: u32, mode_id: u32, refresh: i32) {
-        let mode = self
-            .modes_by_id
-            .entry(mode_id)
-            .or_default();
+        let mode = self.modes_by_id.entry(mode_id).or_default();
         mode.head_id = head_id;
         mode.refresh_mhz = Some(refresh);
     }
@@ -853,9 +847,9 @@ impl CosmicHeadIndex {
                     .head_id(&head.name)
                     .ok_or_else(|| format!("unknown COSMIC output: {}", head.name))?;
                 let mode_id = match head.mode {
-                    Some((width, height, refresh_mhz)) => {
-                        Some(self.mode_id(head_id, width, height, refresh_mhz).ok_or_else(
-                            || match refresh_mhz {
+                    Some((width, height, refresh_mhz)) => Some(
+                        self.mode_id(head_id, width, height, refresh_mhz)
+                            .ok_or_else(|| match refresh_mhz {
                                 Some(refresh_mhz) => format!(
                                     "COSMIC output mode unavailable for {}: {}x{}@{}Hz",
                                     head.name,
@@ -867,9 +861,8 @@ impl CosmicHeadIndex {
                                     "COSMIC output mode unavailable for {}: {width}x{height}",
                                     head.name
                                 ),
-                            },
-                        )?)
-                    }
+                            })?,
+                    ),
                     None => None,
                 };
                 Ok(OutputHeadConfiguration {
