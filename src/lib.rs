@@ -18,7 +18,7 @@ use zbus::{dbus_interface, ConnectionBuilder, SignalContext};
 use zvariant::{DeserializeDict, SerializeDict, Type};
 
 use crate::wayland_observer::{
-    CosmicApplyRequest, CosmicHeadRequest, OutputSnapshot, WaylandApplyHandle,
+    refresh_matches, CosmicApplyRequest, CosmicHeadRequest, OutputSnapshot, WaylandApplyHandle,
 };
 
 lazy_static! {
@@ -123,18 +123,21 @@ pub fn plan_cosmic_profile(
             return Err(format!("COSMIC profile contains duplicate output: {name}"));
         }
 
-        let dimensions = parse_mode_dimensions(mode_id)
+        let requested_mode = parse_mode_request(mode_id)
             .ok_or_else(|| format!("COSMIC profile mode is malformed for {name}: {mode_id}"))?;
         let mode = head
             .modes
             .iter()
-            .find(|mode| (mode.width, mode.height) == dimensions)
-            .ok_or_else(|| {
-                format!(
-                    "COSMIC profile mode is unavailable for {name}: {}x{}",
-                    dimensions.0, dimensions.1
-                )
-            })?;
+            .find(|mode| {
+                (mode.width, mode.height) == (requested_mode.0, requested_mode.1)
+                    && match requested_mode.2 {
+                        Some(refresh_mhz) => mode
+                            .refresh_mhz
+                            .is_some_and(|observed| refresh_matches(refresh_mhz, observed)),
+                        None => true,
+                    }
+            })
+            .ok_or_else(|| format_mode_unavailable(name, requested_mode))?;
         let scale_milli = (logical_monitor.scale() * 1000.0).round();
         if !scale_milli.is_finite() || scale_milli <= 0.0 || scale_milli > u32::MAX as f64 {
             return Err(format!("COSMIC profile scale is invalid for {name}"));
@@ -175,14 +178,14 @@ fn build_cosmic_apply_request(
                 "COSMIC apply request contains duplicate output: {name}"
             ));
         }
-        let dimensions = parse_mode_dimensions(mode_id).ok_or_else(|| {
+        let requested_mode = parse_mode_request(mode_id).ok_or_else(|| {
             format!("COSMIC apply request mode is malformed for {name}: {mode_id}")
         })?;
 
         heads.push(CosmicHeadRequest {
             name: name.to_string(),
             enabled: true,
-            mode: Some(dimensions),
+            mode: Some(requested_mode),
             position: logical_monitor.position(),
             transform: logical_monitor.transform(),
             scale: logical_monitor.scale(),
@@ -207,10 +210,40 @@ fn build_cosmic_apply_request(
     Ok(CosmicApplyRequest { serial, heads })
 }
 
-fn parse_mode_dimensions(mode_id: &str) -> Option<(i32, i32)> {
+fn parse_mode_request(mode_id: &str) -> Option<(i32, i32, Option<i32>)> {
     let dimensions = mode_id.split('@').next()?;
     let (width, height) = dimensions.split_once('x')?;
-    Some((width.parse().ok()?, height.parse().ok()?))
+    let refresh_mhz = match mode_id.split_once('@') {
+        Some((_, refresh)) => Some(parse_refresh_mhz(
+            refresh.strip_suffix("Hz").unwrap_or(refresh),
+        )?),
+        None => None,
+    };
+    Some((width.parse().ok()?, height.parse().ok()?, refresh_mhz))
+}
+
+fn parse_refresh_mhz(refresh: &str) -> Option<i32> {
+    let hz = refresh.parse::<f64>().ok()?;
+    let mhz = (hz * 1000.0).round();
+    if !mhz.is_finite() || mhz < i32::MIN as f64 || mhz > i32::MAX as f64 {
+        return None;
+    }
+    Some(mhz as i32)
+}
+
+fn format_mode_unavailable(name: &str, mode: (i32, i32, Option<i32>)) -> String {
+    match mode.2 {
+        Some(refresh_mhz) => format!(
+            "COSMIC profile mode is unavailable for {name}: {}x{}@{}Hz",
+            mode.0,
+            mode.1,
+            refresh_mhz as f64 / 1000.0
+        ),
+        None => format!(
+            "COSMIC profile mode is unavailable for {name}: {}x{}",
+            mode.0, mode.1
+        ),
+    }
 }
 
 pub fn should_reload_kanshi(xdg_current_desktop: Option<&str>) -> bool {
@@ -1185,7 +1218,7 @@ mod tests {
             .find(|head| head.name == "eDP-1")
             .unwrap();
         assert!(enabled.enabled);
-        assert_eq!(enabled.mode, Some((1920, 1080)));
+        assert_eq!(enabled.mode, Some((1920, 1080, Some(60_000))));
         let disabled = request
             .heads
             .iter()
@@ -1267,6 +1300,147 @@ mod tests {
     }
 
     #[test]
+    fn plans_cosmic_profile_with_exact_refresh_when_sizes_match() {
+        let snapshot = OutputSnapshot {
+            serial: 12,
+            heads: vec![OutputHeadSnapshot {
+                name: "DP-1".to_string(),
+                description: Some("DP-1 description".to_string()),
+                enabled: true,
+                position: Some((0, 0)),
+                transform: Some(0),
+                scale: Some(1.0),
+                current_mode: Some(OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_mhz: Some(50_000),
+                    preferred: false,
+                    current: true,
+                }),
+                modes: vec![
+                    OutputModeSnapshot {
+                        width: 1920,
+                        height: 1080,
+                        refresh_mhz: Some(50_000),
+                        preferred: false,
+                        current: true,
+                    },
+                    OutputModeSnapshot {
+                        width: 1920,
+                        height: 1080,
+                        refresh_mhz: Some(60_000),
+                        preferred: true,
+                        current: false,
+                    },
+                ],
+            }],
+        };
+        let profile = vec![MonitorApply::test_new(
+            "DP-1",
+            "1920x1080@60Hz",
+            0,
+            0,
+            1.0,
+            0,
+            true,
+        )];
+
+        assert_eq!(
+            plan_cosmic_profile(&snapshot, &profile).unwrap(),
+            vec![CosmicOutputPlan {
+                name: "DP-1".to_string(),
+                position: (0, 0),
+                transform: 0,
+                scale_milli: 1000,
+                mode: (1920, 1080, Some(60_000)),
+            }]
+        );
+    }
+
+    #[test]
+    fn plans_cosmic_profile_with_rounded_refresh_against_compositor_refresh() {
+        let snapshot = OutputSnapshot {
+            serial: 13,
+            heads: vec![OutputHeadSnapshot {
+                name: "DP-1".to_string(),
+                description: Some("DP-1 description".to_string()),
+                enabled: true,
+                position: Some((0, 0)),
+                transform: Some(0),
+                scale: Some(1.0),
+                current_mode: Some(OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_mhz: Some(60_004),
+                    preferred: true,
+                    current: true,
+                }),
+                modes: vec![OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_mhz: Some(60_004),
+                    preferred: true,
+                    current: true,
+                }],
+            }],
+        };
+        let profile = vec![MonitorApply::test_new(
+            "DP-1",
+            "1920x1080@60Hz",
+            0,
+            0,
+            1.0,
+            0,
+            true,
+        )];
+
+        assert_eq!(
+            plan_cosmic_profile(&snapshot, &profile).unwrap()[0].mode,
+            (1920, 1080, Some(60_004))
+        );
+    }
+
+    #[test]
+    fn plans_cosmic_profile_keeps_non_rounded_refresh_exact() {
+        let snapshot = OutputSnapshot {
+            serial: 14,
+            heads: vec![OutputHeadSnapshot {
+                name: "DP-1".to_string(),
+                description: Some("DP-1 description".to_string()),
+                enabled: true,
+                position: Some((0, 0)),
+                transform: Some(0),
+                scale: Some(1.0),
+                current_mode: Some(OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_mhz: Some(60_004),
+                    preferred: true,
+                    current: true,
+                }),
+                modes: vec![OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_mhz: Some(60_004),
+                    preferred: true,
+                    current: true,
+                }],
+            }],
+        };
+        let profile = vec![MonitorApply::test_new(
+            "DP-1",
+            "1920x1080@60.001Hz",
+            0,
+            0,
+            1.0,
+            0,
+            true,
+        )];
+
+        assert!(plan_cosmic_profile(&snapshot, &profile).is_err());
+    }
+
+    #[test]
     fn rejects_cosmic_profile_when_output_mode_is_not_observed() {
         let snapshot = OutputSnapshot {
             serial: 11,
@@ -1293,7 +1467,7 @@ mod tests {
 
         assert_eq!(
             plan_cosmic_profile(&snapshot, &profile),
-            Err("COSMIC profile mode is unavailable for DP-1: 3840x2160".to_string())
+            Err("COSMIC profile mode is unavailable for DP-1: 3840x2160@60Hz".to_string())
         );
     }
 
