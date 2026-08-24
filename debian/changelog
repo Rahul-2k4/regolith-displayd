@@ -1,3 +1,9 @@
+regolith-displayd (0.3.4-1) jammy; urgency=medium
+
+  * Fix Debian metadata lintian findings.
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 01 Aug 2026 00:00:00 +0000
+
 regolith-displayd (0.3.4) jammy; urgency=medium
 
   * Update for resolute

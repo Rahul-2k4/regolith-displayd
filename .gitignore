@@ -1,2 +1,7 @@
 /target
 debian/files
+vendor/
+vendor.tar
+.cargo/config
+.cargo/config.toml
+debian/tmp_files/

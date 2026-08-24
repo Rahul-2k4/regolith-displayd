@@ -1,13 +1,15 @@
 [Unit]
 Description=Start Kanshi for Regolith
 PartOf=graphical-session.target
-Wants=gnome-session.target
-After=gnome-session.target
+PartOf=regolith-gnome.target
+PartOf=regolith-cosmic.target
+StartLimitIntervalSec=10
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/kanshi -c %h/.config/regolith3/kanshi/config
 Restart=on-failure
-StartLimitIntervalSec=10
-StartLimitBurst=5
 
+[Install]
+WantedBy=regolith-gnome.target regolith-cosmic.target

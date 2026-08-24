@@ -1,0 +1,1653 @@
+//! Standalone Wayland output observer for wlroots output-management snapshots.
+//!
+//! This module is intentionally isolated from `DisplayManager` and the existing
+//! Sway IPC path. It provides a bounded API that can collect immutable output
+//! snapshots directly from a Wayland compositor that exposes
+//! `zwlr_output_manager_v1`.
+
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
+
+use calloop::channel as calloop_channel;
+use calloop::EventLoop;
+use calloop_wayland_source::WaylandSource;
+use wayland_client::{
+    event_created_child,
+    globals::{registry_queue_init, GlobalListContents},
+    protocol::wl_registry,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
+};
+use wayland_protocols_wlr::output_management::v1::client::{
+    zwlr_output_configuration_head_v1,
+    zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1,
+    zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
+    zwlr_output_head_v1,
+    zwlr_output_head_v1::ZwlrOutputHeadV1,
+    zwlr_output_manager_v1,
+    zwlr_output_manager_v1::ZwlrOutputManagerV1,
+    zwlr_output_mode_v1,
+    zwlr_output_mode_v1::ZwlrOutputModeV1,
+};
+
+/// Immutable snapshot of the compositor output state published by one manager `done` event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputSnapshot {
+    /// Output-management serial attached to the snapshot.
+    pub serial: u32,
+    /// Stable, name-sorted output heads present at publication time.
+    pub heads: Vec<OutputHeadSnapshot>,
+}
+
+/// Immutable snapshot of one output head.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputHeadSnapshot {
+    /// Stable compositor-defined head name such as `HDMI-A-1`.
+    pub name: String,
+    /// Human-readable description when the compositor provides one.
+    pub description: Option<String>,
+    /// Whether the head is currently enabled.
+    pub enabled: bool,
+    /// Current global compositor position for enabled heads.
+    pub position: Option<(i32, i32)>,
+    /// Current wl_output transform code for enabled heads.
+    pub transform: Option<u32>,
+    /// Normalized scale for enabled heads.
+    pub scale: Option<f64>,
+    /// The selected current mode snapshot when known.
+    pub current_mode: Option<OutputModeSnapshot>,
+    /// All known modes for the head in deterministic order.
+    pub modes: Vec<OutputModeSnapshot>,
+}
+
+/// Immutable snapshot of one output mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputModeSnapshot {
+    /// Mode width in hardware pixels.
+    pub width: i32,
+    /// Mode height in hardware pixels.
+    pub height: i32,
+    /// Refresh rate in mHz when provided by the compositor.
+    pub refresh_mhz: Option<i32>,
+    /// Whether the compositor marks this mode as preferred.
+    pub preferred: bool,
+    /// Whether this mode is selected as current in the published snapshot.
+    pub current: bool,
+}
+
+/// Controlled failures returned by the standalone observer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WaylandObserverError {
+    /// Connecting to the compositor failed.
+    ConnectionFailed(String),
+    /// The initial Wayland global discovery roundtrip failed.
+    GlobalDiscoveryFailed(String),
+    /// The compositor does not expose the required output-management global.
+    UnsupportedGlobal { name: &'static str },
+    /// Dispatching Wayland events failed.
+    DispatchFailed(String),
+    /// Spawning the dedicated observation thread failed.
+    ThreadSpawnFailed(String),
+    /// The compositor destroyed the output manager and observation cannot continue.
+    ManagerFinished,
+    /// Internal snapshot state became inconsistent while processing protocol events.
+    StateViolation(String),
+}
+
+impl fmt::Display for WaylandObserverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConnectionFailed(message) => write!(f, "Wayland connection failed: {message}"),
+            Self::GlobalDiscoveryFailed(message) => {
+                write!(f, "Wayland global discovery failed: {message}")
+            }
+            Self::UnsupportedGlobal { name } => {
+                write!(f, "Required Wayland global is unavailable: {name}")
+            }
+            Self::DispatchFailed(message) => write!(f, "Wayland dispatch failed: {message}"),
+            Self::ThreadSpawnFailed(message) => {
+                write!(f, "Wayland observer thread spawn failed: {message}")
+            }
+            Self::ManagerFinished => write!(f, "Wayland output manager finished observation"),
+            Self::StateViolation(message) => {
+                write!(f, "Wayland observer state violation: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WaylandObserverError {}
+
+/// Standalone observer entry point.
+#[derive(Debug, Default)]
+pub struct WaylandOutputObserver;
+
+impl WaylandOutputObserver {
+    /// Connect to the compositor referenced by the current environment and start
+    /// a dedicated observation thread. The thread runs a `calloop` event loop
+    /// with two sources: the Wayland connection (forwarding every
+    /// `zwlr_output_manager_v1.done` snapshot through the returned receiver)
+    /// and an inbound channel for apply/test requests submitted through the
+    /// returned [`WaylandApplyHandle`].
+    #[allow(clippy::type_complexity)]
+    pub fn observe() -> Result<
+        (
+            Receiver<Result<OutputSnapshot, WaylandObserverError>>,
+            WaylandApplyHandle,
+        ),
+        WaylandObserverError,
+    > {
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let (publication_tx, publication_rx) = mpsc::channel();
+        let (apply_tx, apply_rx) = calloop_channel::channel::<ApplyRequestMessage>();
+
+        thread::Builder::new()
+            .name("wayland-output-observer".to_string())
+            .spawn(move || {
+                let startup = Self::connect_and_bind();
+                let (connection, queue, mut state) = match startup {
+                    Ok(parts) => {
+                        let _ = startup_tx.send(Ok(()));
+                        parts
+                    }
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error));
+                        return;
+                    }
+                };
+
+                Self::run_observer_loop(connection, queue, &mut state, publication_tx, apply_rx);
+            })
+            .map_err(|error| WaylandObserverError::ThreadSpawnFailed(error.to_string()))?;
+
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok((publication_rx, WaylandApplyHandle { sender: apply_tx })),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(WaylandObserverError::DispatchFailed(format!(
+                "observer startup channel closed unexpectedly: {error}"
+            ))),
+        }
+    }
+
+    /// Connect to the compositor referenced by the current environment and return
+    /// the first immutable snapshot published by `zwlr_output_manager_v1.done`.
+    pub fn collect_current() -> Result<OutputSnapshot, WaylandObserverError> {
+        let connection = Connection::connect_to_env()
+            .map_err(|error| WaylandObserverError::ConnectionFailed(error.to_string()))?;
+        Self::collect_from_connection(&connection)
+    }
+
+    fn collect_from_connection(
+        connection: &Connection,
+    ) -> Result<OutputSnapshot, WaylandObserverError> {
+        let (mut queue, mut state) = Self::connect_and_bind_from_connection(connection)?;
+
+        loop {
+            if let Some(result) = state.take_next_result() {
+                return result;
+            }
+            queue
+                .blocking_dispatch(&mut state)
+                .map_err(|error| WaylandObserverError::DispatchFailed(error.to_string()))?;
+        }
+    }
+
+    fn connect_and_bind(
+    ) -> Result<(Connection, EventQueue<ObserverState>, ObserverState), WaylandObserverError> {
+        let connection = Connection::connect_to_env()
+            .map_err(|error| WaylandObserverError::ConnectionFailed(error.to_string()))?;
+        let (queue, state) = Self::connect_and_bind_from_connection(&connection)?;
+        Ok((connection, queue, state))
+    }
+
+    fn connect_and_bind_from_connection(
+        connection: &Connection,
+    ) -> Result<(EventQueue<ObserverState>, ObserverState), WaylandObserverError> {
+        let (globals, queue) = registry_queue_init::<ObserverState>(connection)
+            .map_err(|error| WaylandObserverError::GlobalDiscoveryFailed(error.to_string()))?;
+        let qh = queue.handle();
+        let manager: ZwlrOutputManagerV1 =
+            globals
+                .bind(&qh, 1..=4, ())
+                .map_err(|_| WaylandObserverError::UnsupportedGlobal {
+                    name: "zwlr_output_manager_v1",
+                })?;
+
+        let state = ObserverState {
+            manager: Some(manager),
+            queue_handle: Some(qh),
+            ..ObserverState::default()
+        };
+
+        Ok((queue, state))
+    }
+
+    /// Runs the dedicated observer thread's `calloop` event loop.
+    ///
+    /// Two sources are registered on it: the Wayland connection (bridged via
+    /// `calloop-wayland-source`'s `WaylandSource`, which owns flushing
+    /// outgoing requests and reading incoming events) and the inbound apply
+    /// request channel. Apply requests must be handled on this exact thread
+    /// because the retained `zwlr_output_head_v1`/`zwlr_output_mode_v1`
+    /// proxies in `state.handles` are only valid on the connection that
+    /// discovered them.
+    fn run_observer_loop(
+        connection: Connection,
+        queue: EventQueue<ObserverState>,
+        state: &mut ObserverState,
+        publication_tx: Sender<Result<OutputSnapshot, WaylandObserverError>>,
+        apply_rx: calloop_channel::Channel<ApplyRequestMessage>,
+    ) {
+        let mut event_loop: EventLoop<ObserverState> = match EventLoop::try_new() {
+            Ok(event_loop) => event_loop,
+            Err(error) => {
+                state.store_terminal(WaylandObserverError::ThreadSpawnFailed(error.to_string()));
+                publish_pending_results(state, &publication_tx);
+                return;
+            }
+        };
+
+        let loop_handle = event_loop.handle();
+
+        if let Err(error) = WaylandSource::new(connection, queue).insert(loop_handle.clone()) {
+            state.store_terminal(WaylandObserverError::ThreadSpawnFailed(error.to_string()));
+            publish_pending_results(state, &publication_tx);
+            return;
+        }
+
+        let insert_result = loop_handle.insert_source(apply_rx, |event, _, state| {
+            if let calloop_channel::Event::Msg(message) = event {
+                handle_apply_request(state, message);
+            }
+        });
+        if let Err(error) = insert_result {
+            state.store_terminal(WaylandObserverError::ThreadSpawnFailed(error.to_string()));
+            publish_pending_results(state, &publication_tx);
+            return;
+        }
+
+        let signal = event_loop.get_signal();
+        let run_result = event_loop.run(None::<Duration>, state, |state| {
+            if publish_pending_results(state, &publication_tx).should_stop() {
+                signal.stop();
+            }
+        });
+
+        if let Err(error) = run_result {
+            state.store_terminal(WaylandObserverError::DispatchFailed(error.to_string()));
+        }
+        publish_pending_results(state, &publication_tx);
+    }
+}
+
+/// A request to apply (or test) an output configuration, expressed in terms
+/// meaningful across the D-Bus/async boundary: compositor-stable output
+/// names rather than Wayland protocol object IDs. The observer thread
+/// resolves these names against its retained proxies before building a
+/// `ZwlrOutputConfigurationV1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CosmicHeadRequest {
+    pub name: String,
+    pub enabled: bool,
+    /// Requested mode dimensions plus optional refresh in millihertz.
+    /// When refresh is present, mode resolution must stay exact even when the
+    /// compositor advertises multiple refresh rates for the same size.
+    pub mode: Option<(i32, i32, Option<i32>)>,
+    pub position: (i32, i32),
+    pub transform: u32,
+    pub scale: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CosmicApplyRequest {
+    pub serial: u32,
+    pub heads: Vec<CosmicHeadRequest>,
+}
+
+/// Message sent through the calloop channel into the observer thread.
+#[derive(Debug)]
+pub(crate) struct ApplyRequestMessage {
+    pub request: CosmicApplyRequest,
+    pub verify_only: bool,
+    pub response: Sender<Result<(), String>>,
+}
+
+/// Handle for submitting an apply/test request into the dedicated observer
+/// thread from outside it. Intended to be called from
+/// `tokio::task::spawn_blocking` so the calling async executor is never
+/// blocked on the compositor round-trip.
+#[derive(Debug, Clone)]
+pub struct WaylandApplyHandle {
+    sender: calloop_channel::Sender<ApplyRequestMessage>,
+}
+
+impl WaylandApplyHandle {
+    #[cfg(test)]
+    pub(crate) fn for_test(sender: calloop_channel::Sender<ApplyRequestMessage>) -> Self {
+        Self { sender }
+    }
+
+    /// Submit a configuration request and block for the compositor's
+    /// outcome. Must not be called from an async context directly; wrap in
+    /// `tokio::task::spawn_blocking`.
+    pub fn apply(&self, request: CosmicApplyRequest, verify_only: bool) -> Result<(), String> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.sender
+            .send(ApplyRequestMessage {
+                request,
+                verify_only,
+                response: response_tx,
+            })
+            .map_err(|_| "Wayland observer thread is no longer running".to_string())?;
+        response_rx
+            .recv()
+            .map_err(|_| "Wayland observer thread dropped the configuration response".to_string())?
+    }
+}
+
+/// Resolves a name-based [`CosmicApplyRequest`] against retained proxies and
+/// submits it to the compositor. Runs on the observer thread only.
+fn handle_apply_request(state: &mut ObserverState, message: ApplyRequestMessage) {
+    let Some(manager) = state.manager.clone() else {
+        let _ = message
+            .response
+            .send(Err("Wayland output manager is unavailable".to_string()));
+        return;
+    };
+    let Some(qh) = state.queue_handle.clone() else {
+        let _ = message.response.send(Err(
+            "Wayland observer queue handle is unavailable".to_string()
+        ));
+        return;
+    };
+    if state.configuration_response.is_some() {
+        let _ = message.response.send(Err(
+            "another COSMIC output configuration request is already in flight".to_string(),
+        ));
+        return;
+    }
+
+    let resolved = state
+        .handles
+        .cosmic_index
+        .resolve(&message.request)
+        .and_then(|request| {
+            state
+                .handles
+                .build_output_configuration(&manager, &request, &qh)
+        });
+
+    match resolved {
+        Ok(configuration) => {
+            state.configuration_response = Some(message.response);
+            if message.verify_only {
+                configuration.test();
+            } else {
+                configuration.apply();
+            }
+        }
+        Err(error) => {
+            let _ = message.response.send(Err(error));
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ObserverState {
+    collector: SnapshotCollector,
+    handles: OutputManagementHandles,
+    manager: Option<ZwlrOutputManagerV1>,
+    queue_handle: Option<QueueHandle<Self>>,
+    configuration_response: Option<Sender<Result<(), String>>>,
+    terminal_error: Option<WaylandObserverError>,
+    terminal_reached: bool,
+}
+
+impl ObserverState {
+    fn store_error(&mut self, error: SnapshotStateError) {
+        self.store_terminal(error.into());
+    }
+
+    fn store_terminal(&mut self, error: WaylandObserverError) {
+        if self.terminal_reached {
+            return;
+        }
+
+        self.terminal_reached = true;
+        self.terminal_error = Some(error);
+    }
+
+    fn take_next_result(&mut self) -> Option<Result<OutputSnapshot, WaylandObserverError>> {
+        if let Some(snapshot) = self.collector.take_publication() {
+            return Some(Ok(snapshot));
+        }
+
+        self.terminal_error.take().map(Err)
+    }
+
+    fn terminal_drained(&self) -> bool {
+        self.terminal_reached && self.terminal_error.is_none()
+    }
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for ObserverState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wl_registry::WlRegistry,
+        _event: wl_registry::Event,
+        _data: &GlobalListContents,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrOutputManagerV1, ()> for ObserverState {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwlrOutputManagerV1,
+        event: zwlr_output_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_output_manager_v1::Event::Head { head } => {
+                let head_id = head.id().protocol_id();
+                state.handles.retain_head(head);
+                state.collector.note_head(head_id);
+            }
+            zwlr_output_manager_v1::Event::Done { serial } => {
+                if let Err(error) = state.collector.publish_done(serial) {
+                    state.store_error(error);
+                }
+            }
+            zwlr_output_manager_v1::Event::Finished => {
+                state.store_terminal(WaylandObserverError::ManagerFinished);
+            }
+            _ => {}
+        }
+    }
+
+    event_created_child!(ObserverState, ZwlrOutputManagerV1, [
+        zwlr_output_manager_v1::EVT_HEAD_OPCODE => (ZwlrOutputHeadV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrOutputConfigurationV1, ()> for ObserverState {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrOutputConfigurationV1,
+        event: zwlr_output_configuration_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let Some(result) = configuration_outcome(event) else {
+            return;
+        };
+        proxy.destroy();
+        if let Some(response) = state.configuration_response.take() {
+            let _ = response.send(result);
+        }
+    }
+}
+
+impl Dispatch<ZwlrOutputConfigurationHeadV1, ()> for ObserverState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrOutputConfigurationHeadV1,
+        _event: zwlr_output_configuration_head_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrOutputHeadV1, ()> for ObserverState {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrOutputHeadV1,
+        event: zwlr_output_head_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let head_id = proxy.id().protocol_id();
+        state.collector.note_head(head_id);
+
+        let result = match event {
+            zwlr_output_head_v1::Event::Name { name } => {
+                state
+                    .handles
+                    .cosmic_index
+                    .note_head_name(head_id, name.clone());
+                state.collector.set_head_name(head_id, name)
+            }
+            zwlr_output_head_v1::Event::Description { description } => {
+                state.collector.set_head_description(head_id, description)
+            }
+            zwlr_output_head_v1::Event::Enabled { enabled } => {
+                state.collector.set_head_enabled(head_id, enabled != 0)
+            }
+            zwlr_output_head_v1::Event::CurrentMode { mode } => state
+                .collector
+                .set_head_current_mode(head_id, mode.id().protocol_id()),
+            zwlr_output_head_v1::Event::Position { x, y } => {
+                state.collector.set_head_position(head_id, x, y)
+            }
+            zwlr_output_head_v1::Event::Transform { transform } => state
+                .collector
+                .set_head_transform(head_id, transform.into()),
+            zwlr_output_head_v1::Event::Scale { scale } => {
+                state.collector.set_head_scale(head_id, scale)
+            }
+            zwlr_output_head_v1::Event::Mode { mode } => {
+                let mode_id = mode.id().protocol_id();
+                state.handles.retain_mode(head_id, mode);
+                state.collector.note_mode(head_id, mode_id)
+            }
+            zwlr_output_head_v1::Event::Finished => {
+                let result = state.collector.finish_head(head_id);
+                if result.is_ok() {
+                    state.handles.release_head(head_id);
+                }
+                result
+            }
+            _ => Ok(()),
+        };
+
+        if let Err(error) = result {
+            state.store_error(error);
+        }
+    }
+
+    event_created_child!(ObserverState, ZwlrOutputHeadV1, [
+        zwlr_output_head_v1::EVT_MODE_OPCODE => (ZwlrOutputModeV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrOutputModeV1, ()> for ObserverState {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrOutputModeV1,
+        event: zwlr_output_mode_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        let mode_id = proxy.id().protocol_id();
+        let result = match event {
+            zwlr_output_mode_v1::Event::Size { width, height } => {
+                if let Some(head_id) = state.handles.head_id_for_mode(mode_id) {
+                    state
+                        .handles
+                        .cosmic_index
+                        .note_mode_size(head_id, mode_id, width, height);
+                }
+                state.collector.set_mode_size(mode_id, width, height)
+            }
+            zwlr_output_mode_v1::Event::Refresh { refresh } => {
+                if let Some(head_id) = state.handles.head_id_for_mode(mode_id) {
+                    state
+                        .handles
+                        .cosmic_index
+                        .note_mode_refresh(head_id, mode_id, refresh);
+                }
+                state.collector.set_mode_refresh(mode_id, refresh)
+            }
+            zwlr_output_mode_v1::Event::Preferred => state.collector.set_mode_preferred(mode_id),
+            zwlr_output_mode_v1::Event::Finished => {
+                let result = state.collector.finish_mode(mode_id);
+                if result.is_ok() {
+                    state.handles.release_mode(mode_id);
+                }
+                result
+            }
+            _ => Ok(()),
+        };
+
+        if let Err(error) = result {
+            state.store_error(error);
+        }
+    }
+}
+
+/// Keeps output-management proxies alive for a future configuration transaction.
+///
+/// Protocol object IDs remain valid only for the lifetime of this observer
+/// connection. They are sufficient to associate handles with the immutable
+/// snapshot state collected from the same connection.
+#[derive(Debug, Default)]
+pub(crate) struct OutputManagementHandles {
+    heads: HashMap<u32, ZwlrOutputHeadV1>,
+    modes: HashMap<u32, RetainedMode>,
+    /// Pure-data name/mode index kept alongside the retained proxies so a
+    /// name-based [`CosmicApplyRequest`] can be resolved to protocol object
+    /// IDs. Deliberately holds no proxies itself so it can be unit tested
+    /// without a live Wayland connection.
+    cosmic_index: CosmicHeadIndex,
+}
+
+#[derive(Debug)]
+struct RetainedMode {
+    head_id: u32,
+    proxy: ZwlrOutputModeV1,
+}
+
+#[allow(dead_code)]
+impl OutputManagementHandles {
+    fn retain_head(&mut self, head: ZwlrOutputHeadV1) {
+        self.heads.insert(head.id().protocol_id(), head);
+    }
+
+    fn retain_mode(&mut self, head_id: u32, mode: ZwlrOutputModeV1) {
+        self.modes.insert(
+            mode.id().protocol_id(),
+            RetainedMode {
+                head_id,
+                proxy: mode,
+            },
+        );
+    }
+
+    fn release_head(&mut self, head_id: u32) {
+        self.heads.remove(&head_id);
+        self.modes.retain(|_, mode| mode.head_id != head_id);
+    }
+
+    fn release_mode(&mut self, mode_id: u32) {
+        self.modes.remove(&mode_id);
+    }
+
+    /// Returns the head ID that owns a retained mode proxy, if any.
+    fn head_id_for_mode(&self, mode_id: u32) -> Option<u32> {
+        self.modes.get(&mode_id).map(|mode| mode.head_id)
+    }
+
+    fn build_output_configuration(
+        &self,
+        manager: &ZwlrOutputManagerV1,
+        request: &OutputConfigurationRequest,
+        qh: &QueueHandle<ObserverState>,
+    ) -> Result<ZwlrOutputConfigurationV1, String> {
+        request.validate(self.heads.keys().copied())?;
+        let configuration = manager.create_configuration(request.serial, qh, ());
+        for (head_id, head) in &self.heads {
+            let spec = request
+                .heads
+                .iter()
+                .find(|spec| spec.head_id == *head_id)
+                .unwrap();
+            if spec.enabled {
+                let head_config = configuration.enable_head(head, qh, ());
+                let mode_id = spec
+                    .mode_id
+                    .ok_or_else(|| format!("enabled head {head_id} has no mode"))?;
+                let mode = self
+                    .mode(*head_id, mode_id)
+                    .ok_or_else(|| format!("mode {mode_id} does not belong to head {head_id}"))?;
+                head_config.set_mode(mode);
+                head_config.set_position(spec.position.0, spec.position.1);
+                head_config.set_transform(
+                    wayland_client::protocol::wl_output::Transform::try_from(spec.transform)
+                        .map_err(|_| format!("invalid transform for head {head_id}"))?,
+                );
+                head_config.set_scale(spec.scale);
+            } else {
+                configuration.disable_head(head);
+            }
+        }
+        Ok(configuration)
+    }
+
+    /// Returns the retained head proxy for a protocol object ID.
+    pub(crate) fn head(&self, head_id: u32) -> Option<&ZwlrOutputHeadV1> {
+        self.heads.get(&head_id)
+    }
+
+    /// Returns the retained mode proxy when it belongs to the given head ID.
+    pub(crate) fn mode(&self, head_id: u32, mode_id: u32) -> Option<&ZwlrOutputModeV1> {
+        self.modes
+            .get(&mode_id)
+            .filter(|mode| mode.head_id == head_id)
+            .map(|mode| &mode.proxy)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputHeadConfiguration {
+    pub head_id: u32,
+    pub enabled: bool,
+    pub mode_id: Option<u32>,
+    pub position: (i32, i32),
+    pub transform: u32,
+    pub scale: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputConfigurationRequest {
+    pub serial: u32,
+    pub heads: Vec<OutputHeadConfiguration>,
+}
+
+impl OutputConfigurationRequest {
+    fn validate<I>(&self, retained_heads: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let retained = retained_heads
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let requested = self
+            .heads
+            .iter()
+            .map(|head| head.head_id)
+            .collect::<std::collections::HashSet<_>>();
+        if requested.len() != self.heads.len() {
+            return Err("output configuration contains a duplicate head".to_string());
+        }
+        if requested != retained {
+            return Err(
+                "output configuration must configure every retained head exactly once".to_string(),
+            );
+        }
+        if self
+            .heads
+            .iter()
+            .any(|head| !head.scale.is_finite() || head.scale <= 0.0)
+        {
+            return Err("output configuration contains an invalid scale".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Pure-data index mapping compositor-stable output names (and mode
+/// dimensions) to the protocol object IDs retained by
+/// [`OutputManagementHandles`]. Kept separate from the proxy-holding maps so
+/// it can be constructed and unit tested without a live Wayland connection.
+#[derive(Debug, Default)]
+pub(crate) struct CosmicHeadIndex {
+    head_ids_by_name: HashMap<String, u32>,
+    modes_by_id: HashMap<u32, IndexedMode>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct IndexedMode {
+    head_id: u32,
+    width: Option<i32>,
+    height: Option<i32>,
+    refresh_mhz: Option<i32>,
+}
+
+impl CosmicHeadIndex {
+    fn note_head_name(&mut self, head_id: u32, name: String) {
+        self.head_ids_by_name.insert(name, head_id);
+    }
+
+    fn note_mode_size(&mut self, head_id: u32, mode_id: u32, width: i32, height: i32) {
+        let mode = self.modes_by_id.entry(mode_id).or_default();
+        mode.head_id = head_id;
+        mode.width = Some(width);
+        mode.height = Some(height);
+    }
+
+    fn note_mode_refresh(&mut self, head_id: u32, mode_id: u32, refresh: i32) {
+        let mode = self.modes_by_id.entry(mode_id).or_default();
+        mode.head_id = head_id;
+        mode.refresh_mhz = Some(refresh);
+    }
+
+    fn head_id(&self, name: &str) -> Option<u32> {
+        self.head_ids_by_name.get(name).copied()
+    }
+
+    fn mode_id(
+        &self,
+        head_id: u32,
+        width: i32,
+        height: i32,
+        refresh_mhz: Option<i32>,
+    ) -> Option<u32> {
+        let mut matches = self
+            .modes_by_id
+            .iter()
+            .filter(|(_, mode)| {
+                mode.head_id == head_id && mode.width == Some(width) && mode.height == Some(height)
+            })
+            .map(|(mode_id, mode)| (*mode_id, *mode));
+
+        match refresh_mhz {
+            Some(refresh_mhz) => matches
+                .find(|(_, mode)| {
+                    mode.refresh_mhz
+                        .is_some_and(|observed| refresh_matches(refresh_mhz, observed))
+                })
+                .map(|(mode_id, _)| mode_id),
+            None => matches.next().map(|(mode_id, _)| mode_id),
+        }
+    }
+
+    /// Resolves a name-based [`CosmicApplyRequest`] into a protocol-ID-based
+    /// [`OutputConfigurationRequest`] that `OutputManagementHandles` can act
+    /// on directly.
+    pub(crate) fn resolve(
+        &self,
+        request: &CosmicApplyRequest,
+    ) -> Result<OutputConfigurationRequest, String> {
+        let heads = request
+            .heads
+            .iter()
+            .map(|head| {
+                let head_id = self
+                    .head_id(&head.name)
+                    .ok_or_else(|| format!("unknown COSMIC output: {}", head.name))?;
+                let mode_id = match head.mode {
+                    Some((width, height, refresh_mhz)) => Some(
+                        self.mode_id(head_id, width, height, refresh_mhz)
+                            .ok_or_else(|| match refresh_mhz {
+                                Some(refresh_mhz) => format!(
+                                    "COSMIC output mode unavailable for {}: {}x{}@{}Hz",
+                                    head.name,
+                                    width,
+                                    height,
+                                    refresh_mhz as f64 / 1000.0
+                                ),
+                                None => format!(
+                                    "COSMIC output mode unavailable for {}: {width}x{height}",
+                                    head.name
+                                ),
+                            })?,
+                    ),
+                    None => None,
+                };
+                Ok(OutputHeadConfiguration {
+                    head_id,
+                    enabled: head.enabled,
+                    mode_id,
+                    position: head.position,
+                    transform: head.transform,
+                    scale: head.scale,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(OutputConfigurationRequest {
+            serial: request.serial,
+            heads,
+        })
+    }
+}
+
+/// Match the compositor's millihertz value to a requested mode. Mode IDs
+/// written as whole-Hz values are rounded presentation values, so tolerate
+/// the small fractional drift commonly reported by Wayland (for example
+/// 60Hz versus 60.004Hz). Explicit fractional-Hz requests remain exact.
+pub(crate) fn refresh_matches(requested_mhz: i32, observed_mhz: i32) -> bool {
+    requested_mhz == observed_mhz
+        || (requested_mhz.rem_euclid(1000) == 0
+            && (i64::from(observed_mhz) - i64::from(requested_mhz)).abs() <= 100)
+}
+
+fn configuration_outcome(
+    event: wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event,
+) -> Option<Result<(), String>> {
+    match event {
+        wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event::Succeeded => Some(Ok(())),
+        wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event::Failed => Some(Err("COSMIC output configuration failed".to_string())),
+        wayland_protocols_wlr::output_management::v1::client::zwlr_output_configuration_v1::Event::Cancelled => Some(Err("COSMIC output configuration cancelled".to_string())),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SnapshotStateError {
+    InvalidScale(f64),
+    UnknownHead(u32),
+    UnknownMode(u32),
+}
+
+impl fmt::Display for SnapshotStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidScale(scale) => write!(f, "invalid scale value {scale}"),
+            Self::UnknownHead(head_id) => write!(f, "unknown head id {head_id}"),
+            Self::UnknownMode(mode_id) => write!(f, "unknown mode id {mode_id}"),
+        }
+    }
+}
+
+impl From<SnapshotStateError> for WaylandObserverError {
+    fn from(error: SnapshotStateError) -> Self {
+        Self::StateViolation(error.to_string())
+    }
+}
+
+#[derive(Debug, Default)]
+struct SnapshotCollector {
+    heads: HashMap<u32, PendingHead>,
+    mode_to_head: HashMap<u32, u32>,
+    publications: VecDeque<OutputSnapshot>,
+}
+
+impl SnapshotCollector {
+    fn note_head(&mut self, head_id: u32) {
+        self.heads
+            .entry(head_id)
+            .or_insert_with(|| PendingHead::new(head_id));
+    }
+
+    fn set_head_name(&mut self, head_id: u32, name: String) -> Result<(), SnapshotStateError> {
+        self.head_mut(head_id)?.name = Some(name);
+        Ok(())
+    }
+
+    fn set_head_description(
+        &mut self,
+        head_id: u32,
+        description: String,
+    ) -> Result<(), SnapshotStateError> {
+        self.head_mut(head_id)?.description = Some(description);
+        Ok(())
+    }
+
+    fn set_head_enabled(&mut self, head_id: u32, enabled: bool) -> Result<(), SnapshotStateError> {
+        let head = self.head_mut(head_id)?;
+        head.enabled = enabled;
+        if !enabled {
+            head.current_mode_id = None;
+            head.position = None;
+            head.transform = None;
+            head.scale = None;
+        }
+        Ok(())
+    }
+
+    fn set_head_current_mode(
+        &mut self,
+        head_id: u32,
+        mode_id: u32,
+    ) -> Result<(), SnapshotStateError> {
+        let head = self.head_mut(head_id)?;
+        head.current_mode_id = Some(mode_id);
+        Ok(())
+    }
+
+    fn set_head_position(
+        &mut self,
+        head_id: u32,
+        x: i32,
+        y: i32,
+    ) -> Result<(), SnapshotStateError> {
+        self.head_mut(head_id)?.position = Some((x, y));
+        Ok(())
+    }
+
+    fn set_head_transform(
+        &mut self,
+        head_id: u32,
+        transform: u32,
+    ) -> Result<(), SnapshotStateError> {
+        self.head_mut(head_id)?.transform = Some(transform);
+        Ok(())
+    }
+
+    fn set_head_scale(&mut self, head_id: u32, scale: f64) -> Result<(), SnapshotStateError> {
+        self.head_mut(head_id)?.scale = Some(normalize_scale(scale)?);
+        Ok(())
+    }
+
+    fn note_mode(&mut self, head_id: u32, mode_id: u32) -> Result<(), SnapshotStateError> {
+        let head = self.head_mut(head_id)?;
+        head.modes
+            .entry(mode_id)
+            .or_insert_with(|| PendingMode::new(mode_id));
+        self.mode_to_head.insert(mode_id, head_id);
+        Ok(())
+    }
+
+    fn set_mode_size(
+        &mut self,
+        mode_id: u32,
+        width: i32,
+        height: i32,
+    ) -> Result<(), SnapshotStateError> {
+        let mode = self.mode_mut(mode_id)?;
+        mode.width = Some(width);
+        mode.height = Some(height);
+        Ok(())
+    }
+
+    fn set_mode_refresh(&mut self, mode_id: u32, refresh: i32) -> Result<(), SnapshotStateError> {
+        self.mode_mut(mode_id)?.refresh_mhz = Some(refresh);
+        Ok(())
+    }
+
+    fn set_mode_preferred(&mut self, mode_id: u32) -> Result<(), SnapshotStateError> {
+        self.mode_mut(mode_id)?.preferred = true;
+        Ok(())
+    }
+
+    fn finish_head(&mut self, head_id: u32) -> Result<(), SnapshotStateError> {
+        let head = self
+            .heads
+            .remove(&head_id)
+            .ok_or(SnapshotStateError::UnknownHead(head_id))?;
+        for mode_id in head.modes.keys() {
+            self.mode_to_head.remove(mode_id);
+        }
+        Ok(())
+    }
+
+    fn finish_mode(&mut self, mode_id: u32) -> Result<(), SnapshotStateError> {
+        let head_id = self
+            .mode_to_head
+            .remove(&mode_id)
+            .ok_or(SnapshotStateError::UnknownMode(mode_id))?;
+        let head = self.head_mut(head_id)?;
+        head.modes.remove(&mode_id);
+        if head.current_mode_id == Some(mode_id) {
+            head.current_mode_id = None;
+        }
+        Ok(())
+    }
+
+    fn publish_done(&mut self, serial: u32) -> Result<(), SnapshotStateError> {
+        let mut heads = self
+            .heads
+            .values()
+            .cloned()
+            .map(PendingHead::into_snapshot)
+            .collect::<Vec<_>>();
+        heads.sort_by(|left, right| left.name.cmp(&right.name));
+        self.publications
+            .push_back(OutputSnapshot { serial, heads });
+        Ok(())
+    }
+    fn take_publication(&mut self) -> Option<OutputSnapshot> {
+        self.publications.pop_front()
+    }
+
+    fn head_mut(&mut self, head_id: u32) -> Result<&mut PendingHead, SnapshotStateError> {
+        self.heads
+            .get_mut(&head_id)
+            .ok_or(SnapshotStateError::UnknownHead(head_id))
+    }
+
+    fn mode_mut(&mut self, mode_id: u32) -> Result<&mut PendingMode, SnapshotStateError> {
+        let head_id = *self
+            .mode_to_head
+            .get(&mode_id)
+            .ok_or(SnapshotStateError::UnknownMode(mode_id))?;
+        self.head_mut(head_id)?
+            .modes
+            .get_mut(&mode_id)
+            .ok_or(SnapshotStateError::UnknownMode(mode_id))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishStatus {
+    Continue,
+    Stop,
+}
+
+impl PublishStatus {
+    fn should_stop(self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
+fn publish_pending_results(
+    state: &mut ObserverState,
+    publication_tx: &Sender<Result<OutputSnapshot, WaylandObserverError>>,
+) -> PublishStatus {
+    while let Some(result) = state.take_next_result() {
+        if publication_tx.send(result).is_err() {
+            return PublishStatus::Stop;
+        }
+    }
+
+    if state.terminal_drained() {
+        PublishStatus::Stop
+    } else {
+        PublishStatus::Continue
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingHead {
+    id: u32,
+    name: Option<String>,
+    description: Option<String>,
+    enabled: bool,
+    position: Option<(i32, i32)>,
+    transform: Option<u32>,
+    scale: Option<f64>,
+    current_mode_id: Option<u32>,
+    modes: HashMap<u32, PendingMode>,
+}
+
+impl PendingHead {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
+
+    fn into_snapshot(self) -> OutputHeadSnapshot {
+        let mut modes = self.modes.into_values().collect::<Vec<_>>();
+        modes.sort_by(|left, right| {
+            left.width
+                .cmp(&right.width)
+                .then(left.height.cmp(&right.height))
+                .then(left.refresh_mhz.cmp(&right.refresh_mhz))
+                .then(left.preferred.cmp(&right.preferred))
+                .then(left.id.cmp(&right.id))
+        });
+
+        let selected_mode_id = self
+            .current_mode_id
+            .filter(|mode_id| modes.iter().any(|mode| mode.id == *mode_id))
+            .or_else(|| modes.iter().find(|mode| mode.preferred).map(|mode| mode.id));
+
+        let current_mode = selected_mode_id.and_then(|mode_id| {
+            modes
+                .iter()
+                .find(|mode| mode.id == mode_id)
+                .cloned()
+                .map(|mode| mode.into_snapshot(true))
+        });
+        let modes = modes
+            .into_iter()
+            .map(|mode| {
+                let is_current = Some(mode.id) == selected_mode_id;
+                mode.into_snapshot(is_current)
+            })
+            .collect();
+
+        OutputHeadSnapshot {
+            name: self.name.unwrap_or_else(|| format!("head-{}", self.id)),
+            description: self.description,
+            enabled: self.enabled,
+            position: self.position,
+            transform: self.transform,
+            scale: self.scale,
+            current_mode,
+            modes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingMode {
+    id: u32,
+    width: Option<i32>,
+    height: Option<i32>,
+    refresh_mhz: Option<i32>,
+    preferred: bool,
+}
+
+impl PendingMode {
+    fn new(id: u32) -> Self {
+        Self {
+            id,
+            ..Self::default()
+        }
+    }
+
+    fn into_snapshot(self, current: bool) -> OutputModeSnapshot {
+        OutputModeSnapshot {
+            width: self.width.unwrap_or_default(),
+            height: self.height.unwrap_or_default(),
+            refresh_mhz: self.refresh_mhz,
+            preferred: self.preferred,
+            current,
+        }
+    }
+}
+
+fn normalize_scale(scale: f64) -> Result<f64, SnapshotStateError> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(SnapshotStateError::InvalidScale(scale));
+    }
+    let rounded = (scale * 10_000.0).round() / 10_000.0;
+    if rounded <= 0.0 {
+        return Err(SnapshotStateError::InvalidScale(scale));
+    }
+    Ok(rounded)
+}
+
+#[cfg(test)]
+mod output_configuration_tests {
+    use super::zwlr_output_configuration_v1;
+    use super::{configuration_outcome, OutputConfigurationRequest, OutputHeadConfiguration};
+
+    fn head(head_id: u32) -> OutputHeadConfiguration {
+        OutputHeadConfiguration {
+            head_id,
+            enabled: false,
+            mode_id: None,
+            position: (0, 0),
+            transform: 0,
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn request_rejects_duplicate_or_missing_heads() {
+        let duplicate = OutputConfigurationRequest {
+            serial: 1,
+            heads: vec![head(1), head(1)],
+        };
+        assert!(duplicate.validate([1]).is_err());
+        let incomplete = OutputConfigurationRequest {
+            serial: 1,
+            heads: vec![head(1)],
+        };
+        assert!(incomplete.validate([1, 2]).is_err());
+    }
+
+    #[test]
+    fn request_rejects_invalid_scale() {
+        let mut invalid = head(1);
+        invalid.scale = 0.0;
+        let request = OutputConfigurationRequest {
+            serial: 1,
+            heads: vec![invalid],
+        };
+        assert!(request.validate([1]).is_err());
+    }
+
+    #[test]
+    fn terminal_protocol_events_have_explicit_outcomes() {
+        assert_eq!(
+            configuration_outcome(zwlr_output_configuration_v1::Event::Succeeded),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            configuration_outcome(zwlr_output_configuration_v1::Event::Failed),
+            Some(Err("COSMIC output configuration failed".to_string()))
+        );
+        assert_eq!(
+            configuration_outcome(zwlr_output_configuration_v1::Event::Cancelled),
+            Some(Err("COSMIC output configuration cancelled".to_string()))
+        );
+    }
+}
+
+#[cfg(test)]
+mod cosmic_apply_bridge_tests {
+    use super::{ApplyRequestMessage, CosmicApplyRequest, CosmicHeadIndex, CosmicHeadRequest};
+    use calloop::channel;
+    use std::thread;
+    use std::time::Duration;
+
+    fn head_request(name: &str, mode: Option<(i32, i32, Option<i32>)>) -> CosmicHeadRequest {
+        CosmicHeadRequest {
+            name: name.to_string(),
+            enabled: mode.is_some(),
+            mode,
+            position: (0, 0),
+            transform: 0,
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn resolves_named_heads_and_modes_to_protocol_ids() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(7, "DP-1".to_string());
+        index.note_mode_size(7, 20, 2560, 1440);
+
+        let request = CosmicApplyRequest {
+            serial: 3,
+            heads: vec![head_request("DP-1", Some((2560, 1440, None)))],
+        };
+
+        let resolved = index.resolve(&request).unwrap();
+        assert_eq!(resolved.serial, 3);
+        assert_eq!(resolved.heads[0].head_id, 7);
+        assert_eq!(resolved.heads[0].mode_id, Some(20));
+    }
+
+    #[test]
+    fn rejects_unknown_output_name() {
+        let index = CosmicHeadIndex::default();
+        let request = CosmicApplyRequest {
+            serial: 1,
+            heads: vec![head_request("DP-9", None)],
+        };
+
+        assert_eq!(
+            index.resolve(&request),
+            Err("unknown COSMIC output: DP-9".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_unavailable_mode_dimensions() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(1, "eDP-1".to_string());
+        index.note_mode_size(1, 5, 1920, 1080);
+
+        let request = CosmicApplyRequest {
+            serial: 1,
+            heads: vec![head_request("eDP-1", Some((3840, 2160, None)))],
+        };
+
+        assert_eq!(
+            index.resolve(&request),
+            Err("COSMIC output mode unavailable for eDP-1: 3840x2160".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_exact_refresh_when_dimensions_are_ambiguous() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(4, "eDP-1".to_string());
+        index.note_mode_size(4, 50, 1920, 1080);
+        index.note_mode_refresh(4, 50, 50_000);
+        index.note_mode_size(4, 60, 1920, 1080);
+        index.note_mode_refresh(4, 60, 60_000);
+
+        let request = CosmicApplyRequest {
+            serial: 9,
+            heads: vec![head_request("eDP-1", Some((1920, 1080, Some(60_000))))],
+        };
+
+        let resolved = index.resolve(&request).unwrap();
+        assert_eq!(resolved.heads[0].mode_id, Some(60));
+    }
+
+    #[test]
+    fn resolves_rounded_refresh_against_compositor_fractional_refresh() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(4, "eDP-1".to_string());
+        index.note_mode_size(4, 60, 1920, 1080);
+        index.note_mode_refresh(4, 60, 60_004);
+
+        let request = CosmicApplyRequest {
+            serial: 10,
+            heads: vec![head_request("eDP-1", Some((1920, 1080, Some(60_000))))],
+        };
+
+        let resolved = index.resolve(&request).unwrap();
+        assert_eq!(resolved.heads[0].mode_id, Some(60));
+    }
+
+    #[test]
+    fn explicit_fractional_refresh_does_not_use_rounded_match() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(4, "eDP-1".to_string());
+        index.note_mode_size(4, 60, 1920, 1080);
+        index.note_mode_refresh(4, 60, 60_004);
+
+        let request = CosmicApplyRequest {
+            serial: 11,
+            heads: vec![head_request("eDP-1", Some((1920, 1080, Some(60_001))))],
+        };
+
+        assert_eq!(
+            index.resolve(&request),
+            Err("COSMIC output mode unavailable for eDP-1: 1920x1080@60.001Hz".to_string())
+        );
+    }
+
+    /// Exercises the actual `calloop` channel bridge end to end (no live
+    /// Wayland compositor involved): a fake responder standing in for the
+    /// observer thread's Wayland-specific handling receives the message
+    /// through a real `calloop::EventLoop` and replies through the embedded
+    /// response channel.
+    #[test]
+    fn wayland_apply_handle_round_trips_through_calloop_channel() {
+        let (sender, apply_rx) = channel::channel::<ApplyRequestMessage>();
+        let handle = super::WaylandApplyHandle::for_test(sender);
+
+        let worker = thread::spawn(move || {
+            let mut event_loop: calloop::EventLoop<()> = calloop::EventLoop::try_new().unwrap();
+            let loop_handle = event_loop.handle();
+            loop_handle
+                .insert_source(apply_rx, |event, _, _| {
+                    if let channel::Event::Msg(message) = event {
+                        assert_eq!(message.request.serial, 42);
+                        assert!(!message.verify_only);
+                        let _ = message.response.send(Ok(()));
+                    }
+                })
+                .unwrap();
+            event_loop
+                .dispatch(Duration::from_secs(2), &mut ())
+                .unwrap();
+        });
+
+        let result = handle.apply(
+            CosmicApplyRequest {
+                serial: 42,
+                heads: Vec::new(),
+            },
+            false,
+        );
+
+        assert_eq!(result, Ok(()));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn wayland_apply_handle_surfaces_compositor_failure() {
+        let (sender, apply_rx) = channel::channel::<ApplyRequestMessage>();
+        let handle = super::WaylandApplyHandle::for_test(sender);
+
+        let worker = thread::spawn(move || {
+            let mut event_loop: calloop::EventLoop<()> = calloop::EventLoop::try_new().unwrap();
+            let loop_handle = event_loop.handle();
+            loop_handle
+                .insert_source(apply_rx, |event, _, _| {
+                    if let channel::Event::Msg(message) = event {
+                        let _ = message
+                            .response
+                            .send(Err("COSMIC output configuration failed".to_string()));
+                    }
+                })
+                .unwrap();
+            event_loop
+                .dispatch(Duration::from_secs(2), &mut ())
+                .unwrap();
+        });
+
+        let result = handle.apply(
+            CosmicApplyRequest {
+                serial: 1,
+                heads: Vec::new(),
+            },
+            true,
+        );
+
+        assert_eq!(
+            result,
+            Err("COSMIC output configuration failed".to_string())
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_scale, publish_pending_results, ObserverState, OutputSnapshot, PublishStatus,
+        SnapshotCollector, WaylandObserverError,
+    };
+    use std::sync::mpsc;
+
+    #[test]
+    fn normalizes_scale_without_losing_fractional_values() {
+        assert_eq!(normalize_scale(1.24999999).unwrap(), 1.25);
+        assert_eq!(normalize_scale(2.0).unwrap(), 2.0);
+        assert!(normalize_scale(f64::NAN).is_err());
+        assert!(normalize_scale(0.0).is_err());
+    }
+
+    #[test]
+    fn publishes_heads_in_stable_name_order() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(2);
+        collector.set_head_name(2, "HDMI-A-1".to_string()).unwrap();
+        collector.note_head(1);
+        collector.set_head_name(1, "DP-1".to_string()).unwrap();
+
+        collector.publish_done(9).unwrap();
+        let snapshot = collector.take_publication().unwrap();
+        let names = snapshot
+            .heads
+            .into_iter()
+            .map(|head| head.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["DP-1".to_string(), "HDMI-A-1".to_string()]);
+    }
+
+    #[test]
+    fn selects_current_mode_before_preferred_fallback() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(7);
+        collector.set_head_name(7, "DP-2".to_string()).unwrap();
+        collector.set_head_enabled(7, true).unwrap();
+
+        collector.note_mode(7, 10).unwrap();
+        collector.set_mode_size(10, 1920, 1080).unwrap();
+        collector.set_mode_refresh(10, 60_000).unwrap();
+        collector.set_mode_preferred(10).unwrap();
+
+        collector.note_mode(7, 11).unwrap();
+        collector.set_mode_size(11, 2560, 1440).unwrap();
+        collector.set_mode_refresh(11, 144_000).unwrap();
+        collector.set_head_current_mode(7, 11).unwrap();
+
+        collector.publish_done(10).unwrap();
+        let snapshot = collector.take_publication().unwrap();
+        let head = &snapshot.heads[0];
+
+        assert_eq!(head.current_mode.as_ref().unwrap().width, 2560);
+        assert!(head.current_mode.as_ref().unwrap().current);
+        assert!(head.modes.iter().any(|mode| mode.preferred));
+        assert_eq!(head.modes.iter().filter(|mode| mode.current).count(), 1);
+    }
+
+    #[test]
+    fn publishes_only_when_done_arrives() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(1);
+        collector.set_head_name(1, "eDP-1".to_string()).unwrap();
+        assert_eq!(collector.publications.len(), 0);
+
+        collector.note_mode(1, 20).unwrap();
+        collector.set_mode_size(20, 2256, 1504).unwrap();
+        assert_eq!(collector.publications.len(), 0);
+
+        collector.publish_done(1).unwrap();
+        assert_eq!(collector.publications.len(), 1);
+
+        collector
+            .set_head_description(1, "Internal display".to_string())
+            .unwrap();
+        assert_eq!(collector.publications.len(), 1);
+
+        collector.publish_done(2).unwrap();
+        assert_eq!(collector.publications.len(), 2);
+    }
+
+    #[test]
+    fn preserves_repeated_done_publications_in_order() {
+        let mut collector = SnapshotCollector::default();
+        collector.note_head(1);
+        collector.set_head_name(1, "eDP-1".to_string()).unwrap();
+
+        collector.publish_done(5).unwrap();
+        collector
+            .set_head_description(1, "Internal display".to_string())
+            .unwrap();
+        collector.publish_done(6).unwrap();
+
+        let first = collector.take_publication().unwrap();
+        let second = collector.take_publication().unwrap();
+
+        assert_eq!(first.serial, 5);
+        assert_eq!(first.heads[0].description, None);
+        assert_eq!(second.serial, 6);
+        assert_eq!(
+            second.heads[0].description.as_deref(),
+            Some("Internal display")
+        );
+    }
+
+    #[test]
+    fn publication_helper_drains_snapshots_before_terminal_error() {
+        let mut state = ObserverState::default();
+        state.collector.note_head(1);
+        state
+            .collector
+            .set_head_name(1, "eDP-1".to_string())
+            .unwrap();
+        state.collector.publish_done(5).unwrap();
+        state.collector.publish_done(6).unwrap();
+        state.store_terminal(WaylandObserverError::ManagerFinished);
+
+        let (tx, rx) = mpsc::channel();
+        let status = publish_pending_results(&mut state, &tx);
+        let published = rx.try_iter().collect::<Vec<_>>();
+
+        assert_eq!(status, PublishStatus::Stop);
+        assert_eq!(published.len(), 3);
+        assert_eq!(
+            published[0],
+            Ok(OutputSnapshot {
+                serial: 5,
+                heads: vec![first_head_snapshot("eDP-1")],
+            })
+        );
+        assert_eq!(
+            published[1],
+            Ok(OutputSnapshot {
+                serial: 6,
+                heads: vec![first_head_snapshot("eDP-1")],
+            })
+        );
+        assert_eq!(published[2], Err(WaylandObserverError::ManagerFinished));
+    }
+
+    #[test]
+    fn publication_helper_stops_when_receiver_is_dropped() {
+        let mut state = ObserverState::default();
+        state.collector.note_head(3);
+        state
+            .collector
+            .set_head_name(3, "HDMI-A-1".to_string())
+            .unwrap();
+        state.collector.publish_done(9).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+
+        assert_eq!(
+            publish_pending_results(&mut state, &tx),
+            PublishStatus::Stop
+        );
+    }
+
+    fn first_head_snapshot(name: &str) -> super::OutputHeadSnapshot {
+        super::OutputHeadSnapshot {
+            name: name.to_string(),
+            description: None,
+            enabled: false,
+            position: None,
+            transform: None,
+            scale: None,
+            current_mode: None,
+            modes: Vec::new(),
+        }
+    }
+}

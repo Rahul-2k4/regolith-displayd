@@ -1,4 +1,5 @@
 use crate::modes::Modes;
+use crate::wayland_observer::OutputHeadSnapshot;
 use log::warn;
 use num;
 use num_derive::FromPrimitive;
@@ -77,19 +78,35 @@ pub struct MonitorApply {
     pub monitors: Vec<(String, String, MonitorProperties)>,
 }
 
+pub(crate) trait KanshiProfileEntry {
+    fn find_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor>;
+    fn write_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) -> bool;
+}
+
 impl Monitor {
     pub fn new(output: &Output) -> Monitor {
         let output_modes = output.modes.iter().map(|m| Modes::new(output, m)).collect();
-        let description = (
-            output.name.clone(),   // connector
-            output.make.clone(),   // vendor
-            output.model.clone(),  // product
-            output.serial.clone(), // serial
-        );
         Monitor {
-            description,
+            description: (
+                output.name.clone(),   // connector
+                output.make.clone(),   // vendor
+                output.model.clone(),  // product
+                output.serial.clone(), // serial
+            ),
             modes: output_modes,
             properties: MonitorProperties::new(output),
+        }
+    }
+
+    pub fn from_snapshot(head: &OutputHeadSnapshot) -> Monitor {
+        let modes = head.modes.iter().filter_map(Modes::from_snapshot).collect();
+
+        Monitor {
+            // The wlroots output-management snapshot exposes the connector name and
+            // optional human-readable description, but not vendor/model/serial.
+            description: snapshot_identity(&head.name),
+            modes,
+            properties: MonitorProperties::from_snapshot(head),
         }
     }
 
@@ -99,7 +116,11 @@ impl Monitor {
 
     pub fn get_dpy_name(&self) -> String {
         let desc = &self.description;
-        format!("{} {} {}", desc.1, desc.2, desc.3)
+        if desc.1.is_empty() && desc.2.is_empty() && desc.3.is_empty() {
+            desc.0.clone()
+        } else {
+            format!("{} {} {}", desc.1, desc.2, desc.3)
+        }
     }
 
     pub fn get_current_mode(&self) -> &str {
@@ -110,18 +131,51 @@ impl Monitor {
     }
 }
 
-impl PartialEq for Monitor {
-    fn eq(&self, other: &Self) -> bool {
-        self.description == other.description
+#[cfg(test)]
+impl Monitor {
+    pub(crate) fn test_new(
+        name: &str,
+        make: &str,
+        model: &str,
+        serial: &str,
+        modes: Vec<Modes>,
+    ) -> Monitor {
+        Monitor {
+            description: (
+                name.to_string(),
+                make.to_string(),
+                model.to_string(),
+                serial.to_string(),
+            ),
+            modes,
+            properties: MonitorProperties {
+                width: None,
+                height: None,
+                underscanning: None,
+                builtin: Some(false),
+                max_size: None,
+                name: Some(format!("{make} {model} {serial}")),
+            },
+        }
     }
 }
 
+impl PartialEq for Monitor {
+    fn eq(&self, other: &Self) -> bool {
+        self.description == other.description && self.get_current_mode() == other.get_current_mode()
+    }
+}
+
+// Sway reports one physical monitor per logical monitor here, and profile
+// generation resolves that ordered vector through its first element. Keep the
+// watcher identity on the same first-element boundary.
 impl PartialEq for LogicalMonitor {
     fn eq(&self, other: &Self) -> bool {
         self.x_pos == other.x_pos
             && self.y_pos == other.y_pos
-            && self.scale == other.scale
+            && self.scale.to_bits() == other.scale.to_bits()
             && self.transform == other.transform
+            && self.monitors.first() == other.monitors.first()
     }
 }
 
@@ -141,9 +195,8 @@ impl Hash for LogicalMonitor {
         self.y_pos.hash(state);
         self.x_pos.hash(state);
         self.transform.hash(state);
-        let scale_int = (self.scale * 1000f64) as u32;
-        scale_int.hash(state);
-        self.monitors[0].hash(state);
+        self.scale.to_bits().hash(state);
+        self.monitors.first().hash(state);
     }
 }
 
@@ -161,6 +214,23 @@ impl MonitorProperties {
             builtin: Some(builtin),
             max_size: None,
             underscanning: None,
+        }
+    }
+
+    pub fn from_snapshot(head: &OutputHeadSnapshot) -> MonitorProperties {
+        let dimensions = head
+            .current_mode
+            .as_ref()
+            .map(|mode| (mode.width, mode.height))
+            .or_else(|| head.modes.first().map(|mode| (mode.width, mode.height)));
+
+        MonitorProperties {
+            width: dimensions.map(|(width, _)| width),
+            height: dimensions.map(|(_, height)| height),
+            underscanning: None,
+            builtin: Some(head.name.starts_with("eDP")),
+            max_size: None,
+            name: head.description.clone().or_else(|| Some(head.name.clone())),
         }
     }
 }
@@ -230,9 +300,157 @@ impl LogicalMonitor {
             },
         }
     }
+
+    pub fn from_snapshot(head: &OutputHeadSnapshot) -> Option<LogicalMonitor> {
+        if !head.enabled {
+            return None;
+        }
+
+        let scale = match head.scale {
+            Some(scale) => scale,
+            None => {
+                warn!(
+                    "Wayland snapshot missing scale for enabled output {}",
+                    head.name
+                );
+                return None;
+            }
+        };
+        let (x_pos, y_pos) = match head.position {
+            Some(position) => position,
+            None => {
+                warn!(
+                    "Wayland snapshot missing position for enabled output {}",
+                    head.name
+                );
+                return None;
+            }
+        };
+        let transform = match head.transform {
+            Some(transform) => transform,
+            None => {
+                warn!(
+                    "Wayland snapshot missing transform for enabled output {}",
+                    head.name
+                );
+                return None;
+            }
+        };
+
+        Some(LogicalMonitor {
+            x_pos,
+            y_pos,
+            scale,
+            transform,
+            primary: false,
+            monitors: vec![snapshot_identity(&head.name)],
+            properties: LogicalMonitorProperties {
+                dummy: None,
+                dummy2: None,
+            },
+        })
+    }
+
     pub fn get_dpy_name(&self) -> String {
         let desc = &self.monitors[0];
-        format!("{} {} {}", desc.1, desc.2, desc.3)
+        if desc.1.is_empty() && desc.2.is_empty() && desc.3.is_empty() {
+            desc.0.clone()
+        } else {
+            format!("{} {} {}", desc.1, desc.2, desc.3)
+        }
+    }
+}
+
+fn snapshot_identity(name: &str) -> (String, String, String, String) {
+    (
+        name.to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+    )
+}
+
+#[cfg(test)]
+impl LogicalMonitor {
+    pub(crate) fn test_new(
+        name: &str,
+        mode_id: &str,
+        x_pos: i32,
+        y_pos: i32,
+        scale: f64,
+        transform: u32,
+        primary: bool,
+    ) -> LogicalMonitor {
+        LogicalMonitor {
+            x_pos,
+            y_pos,
+            scale,
+            transform,
+            primary,
+            monitors: vec![(
+                name.to_string(),
+                mode_id.to_string(),
+                String::new(),
+                String::new(),
+            )],
+            properties: LogicalMonitorProperties {
+                dummy: None,
+                dummy2: None,
+            },
+        }
+    }
+}
+
+impl MonitorApply {
+    pub(crate) fn output_name_and_mode(&self) -> Option<(&str, &str)> {
+        self.monitors
+            .first()
+            .map(|(name, mode, _)| (name.as_str(), mode.as_str()))
+    }
+
+    pub(crate) fn position(&self) -> (i32, i32) {
+        (self.x_pos, self.y_pos)
+    }
+
+    pub(crate) fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    pub(crate) fn transform(&self) -> u32 {
+        self.transform
+    }
+}
+
+#[cfg(test)]
+impl MonitorApply {
+    pub(crate) fn test_new(
+        name: &str,
+        mode_id: &str,
+        x_pos: i32,
+        y_pos: i32,
+        scale: f64,
+        transform: u32,
+        primary: bool,
+    ) -> MonitorApply {
+        MonitorApply {
+            x_pos,
+            y_pos,
+            scale,
+            transform,
+            primary,
+            monitors: vec![(
+                name.to_string(),
+                mode_id.to_string(),
+                MonitorProperties {
+                    width: None,
+                    height: None,
+                    underscanning: None,
+                    builtin: Some(false),
+                    max_size: None,
+                    name: Some(String::new()),
+                },
+            )],
+        }
     }
 }
 
@@ -245,7 +463,7 @@ impl MonitorApply {
         }
     }
 
-    pub fn search_monitor<'a>(&self, monitors: &'a Vec<Monitor>) -> Option<&'a Monitor> {
+    pub fn search_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
         monitors
             .iter()
             .find(|mon| mon.description.0 == self.monitors[0].0)
@@ -253,7 +471,7 @@ impl MonitorApply {
 
     pub fn search_logical_monitor<'a>(
         &self,
-        logical_monitors: &'a Vec<LogicalMonitor>,
+        logical_monitors: &'a [LogicalMonitor],
     ) -> Option<&'a LogicalMonitor> {
         logical_monitors
             .iter()
@@ -261,29 +479,13 @@ impl MonitorApply {
     }
 
     pub fn save_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) {
-        let dpy_name = monitor.get_dpy_name();
-        let mode = match self.get_modestr(&monitor) {
-            Some(x) => x,
-            _ => return,
-        };
-        let transform =
-            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
-        let config = format!(
-            "output \"{}\" mode {} position {},{} transform {} scale {} enable",
-            dpy_name,
-            mode,
-            self.x_pos,
-            self.y_pos,
-            transform.to_sway(),
-            self.scale
-        );
-        writeln!(kanshi_file, "\t{config}").unwrap();
+        let _ = <Self as KanshiProfileEntry>::write_kanshi(self, kanshi_file, monitor);
     }
 
     pub fn verify(
         &self,
         _sway_connect: &Arc<Mutex<Connection>>,
-        monitors: &Vec<Monitor>,
+        monitors: &[Monitor],
     ) -> zbus::fdo::Result<()> {
         let monitor = self
             .search_monitor(monitors)
@@ -309,5 +511,189 @@ impl MonitorApply {
             return Err(ZError::InvalidArgs(String::from("Invalid tranform")));
         }
         Ok(())
+    }
+}
+
+impl KanshiProfileEntry for MonitorApply {
+    fn find_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
+        self.search_monitor(monitors)
+    }
+
+    fn write_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) -> bool {
+        let dpy_name = monitor.get_dpy_name();
+        let mode = match self.get_modestr(monitor) {
+            Some(x) => x,
+            _ => return false,
+        };
+        let transform =
+            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
+        let config = format!(
+            "output \"{}\" mode {} position {},{} transform {} scale {} enable",
+            dpy_name,
+            mode,
+            self.x_pos,
+            self.y_pos,
+            transform.to_sway(),
+            self.scale
+        );
+        writeln!(kanshi_file, "\t{config}").unwrap();
+        true
+    }
+}
+
+impl KanshiProfileEntry for LogicalMonitor {
+    fn find_monitor<'a>(&self, monitors: &'a [Monitor]) -> Option<&'a Monitor> {
+        let monitor_name = &self.monitors[0].0;
+        monitors
+            .iter()
+            .find(|mon| mon.description.0 == *monitor_name)
+    }
+
+    fn write_kanshi(&self, kanshi_file: &mut Vec<u8>, monitor: &Monitor) -> bool {
+        let dpy_name = monitor.get_dpy_name();
+        let mode = monitor.get_current_mode();
+        let transform =
+            MonitorTransform::from_u32(self.transform).unwrap_or(MonitorTransform::Normal);
+        let config = if mode == "Unknown" {
+            format!(
+                "output \"{}\" position {},{} transform {} scale {} enable",
+                dpy_name,
+                self.x_pos,
+                self.y_pos,
+                transform.to_sway(),
+                self.scale
+            )
+        } else {
+            format!(
+                "output \"{}\" mode {} position {},{} transform {} scale {} enable",
+                dpy_name,
+                mode,
+                self.x_pos,
+                self.y_pos,
+                transform.to_sway(),
+                self.scale
+            )
+        };
+        writeln!(kanshi_file, "\t{config}").unwrap();
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogicalMonitor, Monitor};
+    use crate::wayland_observer::{OutputHeadSnapshot, OutputModeSnapshot};
+
+    fn wayland_head(name: &str) -> OutputHeadSnapshot {
+        OutputHeadSnapshot {
+            name: name.to_string(),
+            description: Some("Desk display".to_string()),
+            enabled: true,
+            position: Some((320, 180)),
+            transform: Some(3),
+            scale: Some(1.25),
+            current_mode: Some(OutputModeSnapshot {
+                width: 2560,
+                height: 1440,
+                refresh_mhz: Some(144_000),
+                preferred: true,
+                current: true,
+            }),
+            modes: vec![
+                OutputModeSnapshot {
+                    width: 1920,
+                    height: 1080,
+                    refresh_mhz: Some(60_000),
+                    preferred: false,
+                    current: false,
+                },
+                OutputModeSnapshot {
+                    width: 2560,
+                    height: 1440,
+                    refresh_mhz: Some(144_000),
+                    preferred: true,
+                    current: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn builds_monitor_from_wayland_snapshot_without_inventing_hardware_identity() {
+        let monitor = Monitor::from_snapshot(&wayland_head("DP-1"));
+
+        assert_eq!(
+            monitor.description,
+            (
+                "DP-1".to_string(),
+                String::new(),
+                String::new(),
+                String::new()
+            )
+        );
+        assert_eq!(monitor.get_dpy_name(), "DP-1");
+        assert_eq!(monitor.properties.name.as_deref(), Some("Desk display"));
+    }
+
+    #[test]
+    fn selects_current_mode_from_wayland_snapshot() {
+        let monitor = Monitor::from_snapshot(&wayland_head("DP-2"));
+
+        assert_eq!(monitor.get_current_mode(), "2560x1440@144Hz");
+        assert_eq!(
+            monitor.modes.iter().filter(|mode| mode.current()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn builds_logical_monitor_from_wayland_snapshot_with_fractional_scale_and_position() {
+        let logical = LogicalMonitor::from_snapshot(&wayland_head("HDMI-A-1")).unwrap();
+
+        assert_eq!(logical.get_dpy_name(), "HDMI-A-1");
+        assert_eq!(logical.scale, 1.25);
+        assert_eq!((logical.x_pos, logical.y_pos), (320, 180));
+        assert_eq!(logical.transform, 3);
+        assert_eq!(
+            logical.monitors,
+            vec![(
+                "HDMI-A-1".to_string(),
+                String::new(),
+                String::new(),
+                String::new()
+            )]
+        );
+    }
+
+    #[test]
+    fn skips_disabled_wayland_heads_for_logical_monitors() {
+        let mut head = wayland_head("eDP-1");
+        head.enabled = false;
+
+        assert!(LogicalMonitor::from_snapshot(&head).is_none());
+    }
+
+    #[test]
+    fn skips_enabled_wayland_head_missing_scale() {
+        let mut head = wayland_head("DP-3");
+        head.scale = None;
+
+        assert!(LogicalMonitor::from_snapshot(&head).is_none());
+    }
+
+    #[test]
+    fn skips_enabled_wayland_head_missing_position() {
+        let mut head = wayland_head("DP-4");
+        head.position = None;
+
+        assert!(LogicalMonitor::from_snapshot(&head).is_none());
+    }
+
+    #[test]
+    fn skips_enabled_wayland_head_missing_transform() {
+        let mut head = wayland_head("DP-5");
+        head.transform = None;
+
+        assert!(LogicalMonitor::from_snapshot(&head).is_none());
     }
 }
