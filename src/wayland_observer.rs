@@ -291,9 +291,9 @@ impl WaylandOutputObserver {
 pub struct CosmicHeadRequest {
     pub name: String,
     pub enabled: bool,
-    /// Requested mode dimensions (width, height). Matched against retained
-    /// mode proxies by dimensions only, mirroring `plan_cosmic_profile`.
-    pub mode: Option<(i32, i32)>,
+    /// Requested mode dimensions and optional refresh. Matched against retained
+    /// mode proxies by exact refresh when supplied, with resolution fallback when absent.plan_cosmic_profile`.
+    pub mode: Option<(i32, i32, Option<i32>)>,
     pub position: (i32, i32),
     pub transform: u32,
     pub scale: f64,
@@ -585,11 +585,17 @@ impl Dispatch<ZwlrOutputModeV1, ()> for ObserverState {
                     state
                         .handles
                         .cosmic_index
-                        .note_mode_size(head_id, mode_id, width, height);
+                        .note_mode_size(head_id, mode_id, width, height, None);
                 }
                 state.collector.set_mode_size(mode_id, width, height)
             }
             zwlr_output_mode_v1::Event::Refresh { refresh } => {
+                if let Some(head_id) = state.handles.head_id_for_mode(mode_id) {
+                    state
+                        .handles
+                        .cosmic_index
+                        .note_mode_refresh(head_id, mode_id, refresh);
+                }
                 state.collector.set_mode_refresh(mode_id, refresh)
             }
             zwlr_output_mode_v1::Event::Preferred => state.collector.set_mode_preferred(mode_id),
@@ -766,7 +772,7 @@ impl OutputConfigurationRequest {
 #[derive(Debug, Default)]
 pub(crate) struct CosmicHeadIndex {
     head_ids_by_name: HashMap<String, u32>,
-    mode_ids_by_head: HashMap<u32, HashMap<(i32, i32), u32>>,
+    mode_ids_by_head: HashMap<u32, HashMap<(i32, i32, Option<i32>), u32>>,
 }
 
 impl CosmicHeadIndex {
@@ -774,21 +780,52 @@ impl CosmicHeadIndex {
         self.head_ids_by_name.insert(name, head_id);
     }
 
-    fn note_mode_size(&mut self, head_id: u32, mode_id: u32, width: i32, height: i32) {
+    fn note_mode_size(
+        &mut self,
+        head_id: u32,
+        mode_id: u32,
+        width: i32,
+        height: i32,
+        refresh_mhz: Option<i32>,
+    ) {
         self.mode_ids_by_head
             .entry(head_id)
             .or_default()
-            .insert((width, height), mode_id);
+            .insert((width, height, None), mode_id);
+        if let Some(refresh_mhz) = refresh_mhz {
+            self.mode_ids_by_head
+                .entry(head_id)
+                .or_default()
+                .insert((width, height, Some(refresh_mhz)), mode_id);
+        }
+    }
+
+    fn note_mode_refresh(&mut self, head_id: u32, mode_id: u32, refresh_mhz: i32) {
+        if let Some(modes) = self.mode_ids_by_head.get_mut(&head_id) {
+            if let Some(((width, height, _), _)) = modes
+                .iter()
+                .find(|(_, id)| **id == mode_id)
+                .map(|(key, id)| (*key, *id))
+            {
+                modes.insert((width, height, Some(refresh_mhz)), mode_id);
+            }
+        }
     }
 
     fn head_id(&self, name: &str) -> Option<u32> {
         self.head_ids_by_name.get(name).copied()
     }
 
-    fn mode_id(&self, head_id: u32, width: i32, height: i32) -> Option<u32> {
+    fn mode_id(
+        &self,
+        head_id: u32,
+        width: i32,
+        height: i32,
+        refresh_mhz: Option<i32>,
+    ) -> Option<u32> {
         self.mode_ids_by_head
             .get(&head_id)?
-            .get(&(width, height))
+            .get(&(width, height, refresh_mhz))
             .copied()
     }
 
@@ -807,14 +844,15 @@ impl CosmicHeadIndex {
                     .head_id(&head.name)
                     .ok_or_else(|| format!("unknown COSMIC output: {}", head.name))?;
                 let mode_id = match head.mode {
-                    Some((width, height)) => {
-                        Some(self.mode_id(head_id, width, height).ok_or_else(|| {
-                            format!(
-                                "COSMIC output mode unavailable for {}: {width}x{height}",
-                                head.name
-                            )
-                        })?)
-                    }
+                    Some((width, height, refresh_mhz)) => Some(
+                        self.mode_id(head_id, width, height, refresh_mhz)
+                            .ok_or_else(|| {
+                                format!(
+                                    "COSMIC output mode unavailable for {}: {width}x{height}",
+                                    head.name
+                                )
+                            })?,
+                    ),
                     None => None,
                 };
                 Ok(OutputHeadConfiguration {
@@ -1229,7 +1267,7 @@ mod cosmic_apply_bridge_tests {
     use std::thread;
     use std::time::Duration;
 
-    fn head_request(name: &str, mode: Option<(i32, i32)>) -> CosmicHeadRequest {
+    fn head_request(name: &str, mode: Option<(i32, i32, Option<i32>)>) -> CosmicHeadRequest {
         CosmicHeadRequest {
             name: name.to_string(),
             enabled: mode.is_some(),
@@ -1244,11 +1282,11 @@ mod cosmic_apply_bridge_tests {
     fn resolves_named_heads_and_modes_to_protocol_ids() {
         let mut index = CosmicHeadIndex::default();
         index.note_head_name(7, "DP-1".to_string());
-        index.note_mode_size(7, 20, 2560, 1440);
+        index.note_mode_size(7, 20, 2560, 1440, Some(60_000));
 
         let request = CosmicApplyRequest {
             serial: 3,
-            heads: vec![head_request("DP-1", Some((2560, 1440)))],
+            heads: vec![head_request("DP-1", Some((2560, 1440, None)))],
         };
 
         let resolved = index.resolve(&request).unwrap();
@@ -1275,16 +1313,38 @@ mod cosmic_apply_bridge_tests {
     fn rejects_unavailable_mode_dimensions() {
         let mut index = CosmicHeadIndex::default();
         index.note_head_name(1, "eDP-1".to_string());
-        index.note_mode_size(1, 5, 1920, 1080);
+        index.note_mode_size(1, 5, 1920, 1080, Some(60_000));
 
         let request = CosmicApplyRequest {
             serial: 1,
-            heads: vec![head_request("eDP-1", Some((3840, 2160)))],
+            heads: vec![head_request("eDP-1", Some((3840, 2160, None)))],
         };
 
         assert_eq!(
             index.resolve(&request),
             Err("COSMIC output mode unavailable for eDP-1: 3840x2160".to_string())
+        );
+    }
+    #[test]
+    fn resolves_exact_refresh_and_keeps_absent_refresh_semantics() {
+        let mut index = CosmicHeadIndex::default();
+        index.note_head_name(1, "DP-1".to_string());
+        index.note_mode_size(1, 50, 1920, 1080, Some(50_000));
+        index.note_mode_size(1, 60, 1920, 1080, Some(60_000));
+
+        let request = CosmicApplyRequest {
+            serial: 1,
+            heads: vec![head_request("DP-1", Some((1920, 1080, Some(60_000))))],
+        };
+        assert_eq!(index.resolve(&request).unwrap().heads[0].mode_id, Some(60));
+
+        let request_without_refresh = CosmicApplyRequest {
+            serial: 1,
+            heads: vec![head_request("DP-1", Some((1920, 1080, None)))],
+        };
+        assert_eq!(
+            index.resolve(&request_without_refresh).unwrap().heads[0].mode_id,
+            Some(60)
         );
     }
 

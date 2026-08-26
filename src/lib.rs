@@ -182,7 +182,7 @@ fn build_cosmic_apply_request(
         heads.push(CosmicHeadRequest {
             name: name.to_string(),
             enabled: true,
-            mode: Some(dimensions),
+            mode: Some((dimensions.0, dimensions.1, parse_mode_refresh(mode_id))),
             position: logical_monitor.position(),
             transform: logical_monitor.transform(),
             scale: logical_monitor.scale(),
@@ -211,6 +211,11 @@ fn parse_mode_dimensions(mode_id: &str) -> Option<(i32, i32)> {
     let dimensions = mode_id.split('@').next()?;
     let (width, height) = dimensions.split_once('x')?;
     Some((width.parse().ok()?, height.parse().ok()?))
+}
+
+fn parse_mode_refresh(mode_id: &str) -> Option<i32> {
+    let refresh = mode_id.split_once("@")?.1.strip_suffix("Hz")?;
+    Some((refresh.parse::<f64>().ok()? * 1000.0).round() as i32)
 }
 
 pub fn should_reload_kanshi(xdg_current_desktop: Option<&str>) -> bool {
@@ -1185,7 +1190,7 @@ mod tests {
             .find(|head| head.name == "eDP-1")
             .unwrap();
         assert!(enabled.enabled);
-        assert_eq!(enabled.mode, Some((1920, 1080)));
+        assert_eq!(enabled.mode, Some((1920, 1080, Some(60_000))));
         let disabled = request
             .heads
             .iter()
