@@ -773,11 +773,28 @@ impl OutputConfigurationRequest {
 pub(crate) struct CosmicHeadIndex {
     head_ids_by_name: HashMap<String, u32>,
     mode_ids_by_head: HashMap<u32, HashMap<(i32, i32, Option<i32>), u32>>,
+    mode_metadata_by_id: HashMap<u32, (u32, Option<i32>, Option<i32>, Option<i32>)>,
 }
 
 impl CosmicHeadIndex {
     fn note_head_name(&mut self, head_id: u32, name: String) {
         self.head_ids_by_name.insert(name, head_id);
+    }
+
+    fn reindex_mode(&mut self, mode_id: u32) {
+        let Some((head_id, width, height, refresh_mhz)) =
+            self.mode_metadata_by_id.get(&mode_id).copied()
+        else {
+            return;
+        };
+        let modes = self.mode_ids_by_head.entry(head_id).or_default();
+        modes.retain(|_, id| *id != mode_id);
+        if let (Some(width), Some(height)) = (width, height) {
+            modes.insert((width, height, None), mode_id);
+            if let Some(refresh_mhz) = refresh_mhz {
+                modes.insert((width, height, Some(refresh_mhz)), mode_id);
+            }
+        }
     }
 
     fn note_mode_size(
@@ -788,28 +805,25 @@ impl CosmicHeadIndex {
         height: i32,
         refresh_mhz: Option<i32>,
     ) {
-        self.mode_ids_by_head
-            .entry(head_id)
-            .or_default()
-            .insert((width, height, None), mode_id);
-        if let Some(refresh_mhz) = refresh_mhz {
-            self.mode_ids_by_head
-                .entry(head_id)
-                .or_default()
-                .insert((width, height, Some(refresh_mhz)), mode_id);
-        }
+        let refresh_mhz = self
+            .mode_metadata_by_id
+            .get(&mode_id)
+            .and_then(|(_, _, _, refresh)| *refresh)
+            .or(refresh_mhz);
+        self.mode_metadata_by_id
+            .insert(mode_id, (head_id, Some(width), Some(height), refresh_mhz));
+        self.reindex_mode(mode_id);
     }
 
     fn note_mode_refresh(&mut self, head_id: u32, mode_id: u32, refresh_mhz: i32) {
-        if let Some(modes) = self.mode_ids_by_head.get_mut(&head_id) {
-            if let Some(((width, height, _), _)) = modes
-                .iter()
-                .find(|(_, id)| **id == mode_id)
-                .map(|(key, id)| (*key, *id))
-            {
-                modes.insert((width, height, Some(refresh_mhz)), mode_id);
-            }
-        }
+        let (stored_head_id, width, height, _) = self
+            .mode_metadata_by_id
+            .get(&mode_id)
+            .copied()
+            .unwrap_or((head_id, None, None, None));
+        self.mode_metadata_by_id
+            .insert(mode_id, (stored_head_id, width, height, Some(refresh_mhz)));
+        self.reindex_mode(mode_id);
     }
 
     fn head_id(&self, name: &str) -> Option<u32> {
@@ -1325,6 +1339,41 @@ mod cosmic_apply_bridge_tests {
             Err("COSMIC output mode unavailable for eDP-1: 3840x2160".to_string())
         );
     }
+    #[test]
+    fn resolves_refresh_regardless_of_size_event_order() {
+        let mut refresh_first = CosmicHeadIndex::default();
+        refresh_first.note_head_name(1, "DP-1".to_string());
+        refresh_first.note_mode_refresh(1, 50, 60_000);
+        refresh_first.note_mode_size(1, 50, 1920, 1080, None);
+        assert_eq!(
+            refresh_first
+                .resolve(&CosmicApplyRequest {
+                    serial: 1,
+                    heads: vec![head_request("DP-1", Some((1920, 1080, Some(60_000))))],
+                })
+                .unwrap()
+                .heads[0]
+                .mode_id,
+            Some(50)
+        );
+
+        let mut size_first = CosmicHeadIndex::default();
+        size_first.note_head_name(1, "DP-1".to_string());
+        size_first.note_mode_size(1, 60, 1920, 1080, None);
+        size_first.note_mode_refresh(1, 60, 60_000);
+        assert_eq!(
+            size_first
+                .resolve(&CosmicApplyRequest {
+                    serial: 1,
+                    heads: vec![head_request("DP-1", Some((1920, 1080, Some(60_000))))],
+                })
+                .unwrap()
+                .heads[0]
+                .mode_id,
+            Some(60)
+        );
+    }
+
     #[test]
     fn resolves_exact_refresh_and_keeps_absent_refresh_semantics() {
         let mut index = CosmicHeadIndex::default();

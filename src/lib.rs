@@ -125,10 +125,14 @@ pub fn plan_cosmic_profile(
 
         let dimensions = parse_mode_dimensions(mode_id)
             .ok_or_else(|| format!("COSMIC profile mode is malformed for {name}: {mode_id}"))?;
+        let refresh_mhz = parse_mode_refresh(mode_id);
         let mode = head
             .modes
             .iter()
-            .find(|mode| (mode.width, mode.height) == dimensions)
+            .find(|mode| {
+                (mode.width, mode.height) == dimensions
+                    && (refresh_mhz.is_none() || mode.refresh_mhz == refresh_mhz)
+            })
             .ok_or_else(|| {
                 format!(
                     "COSMIC profile mode is unavailable for {name}: {}x{}",
@@ -1269,6 +1273,43 @@ mod tests {
             }]
         );
         assert_eq!(cosmic_profile_apply_status().is_err(), true);
+    }
+
+    #[test]
+    fn plans_cosmic_profile_with_exact_refresh_for_same_resolution_modes() {
+        let mut head = snapshot_head(
+            "DP-1",
+            true,
+            Some((0, 0)),
+            Some(0),
+            Some(1.0),
+            1920,
+            1080,
+            Some(50_000),
+        );
+        head.modes.push(OutputModeSnapshot {
+            width: 1920,
+            height: 1080,
+            refresh_mhz: Some(60_000),
+            preferred: false,
+            current: false,
+        });
+        let snapshot = OutputSnapshot {
+            serial: 11,
+            heads: vec![head],
+        };
+        let profile = vec![MonitorApply::test_new(
+            "DP-1",
+            "1920x1080@60Hz",
+            0,
+            0,
+            1.0,
+            0,
+            true,
+        )];
+
+        let plans = plan_cosmic_profile(&snapshot, &profile).unwrap();
+        assert_eq!(plans[0].mode, (1920, 1080, Some(60_000)));
     }
 
     #[test]
